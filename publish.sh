@@ -99,6 +99,6 @@ gh release create "$ltag" "$dest" -R "$REPO" \
 echo "→ 已更新移動標籤 release: $ltag"
 
 echo ""
-echo "✓ 完成。下載指令:"
-echo "  最新版 : gh release download ${ltag} -R ${REPO} -p '${tool}.sh' -O ${tool}.sh"
-echo "  指定版 : gh release download ${vtag} -R ${REPO} -p '${tool}.sh' -O ${tool}.sh"
+echo "✓ 完成。下載指令(公開 repo,免登入):"
+echo "  最新版 : curl -fsSL https://github.com/${REPO}/releases/download/${ltag}/${tool}.sh -o ${tool}.sh"
+echo "  指定版 : curl -fsSL https://github.com/${REPO}/releases/download/${vtag}/${tool}.sh -o ${tool}.sh"
