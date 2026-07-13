@@ -25,6 +25,7 @@ vault_dir_for() {
     set_configs)      echo "aetherSlideAutoConfig" ;;
     install_recorder) echo "專案錄影" ;;
     chrome_debug)     echo "Chrome_debug" ;;
+    fae_bashrc)       echo "FAE_bashrc" ;;
     *) echo "" ;;
   esac
 }
@@ -33,6 +34,7 @@ file_prefix_for() {
     set_configs)      echo "set_configs" ;;
     install_recorder) echo "install_recorder" ;;
     chrome_debug)     echo "chrome_debug" ;;
+    fae_bashrc)       echo "fae_bashrc" ;;
     *) echo "" ;;
   esac
 }
