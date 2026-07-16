@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# fae_bashrc  (v0.2)  — the standardized FAE ~/.bashrc, now with recording
+# fae_bashrc  (v0.3)  — the standardized FAE ~/.bashrc, now with recording
 #
 # FAE on-site shell environment for hospital production machines. This file IS
 # the machine's ~/.bashrc: deploy by REPLACING ~/.bashrc with it, so every FAE
@@ -9,8 +9,9 @@
 #     cp fae_bashrc ~/.bashrc     # (back up the old one first if it matters)
 #
 # v0.2 wires up terminal recording (merged from 專案錄影/install_recorder v5)
-# on top of v0.1's operator features + crash-proof log-lifecycle engine:
-#   [1]  Environment banner + colour-coded prompt (prod=red; override-able)
+# on top of v0.1's operator features + crash-proof log-lifecycle engine.
+# v0.3 drops the login banner and prompt colouring entirely — login is now
+# silent, and the prompt is a plain \u@\h:\w (which already names the machine):
 #   [4]  vi/vim/nano edit tracking (backup -> [IR-BEFORE]/[IR-DIFF]/[IR-AFTER])
 #   [12] History hardening (unlimited, timestamped, written immediately)
 #   REC  `script` recording auto-started at login, finalized as housekeeping,
@@ -42,7 +43,6 @@ case $- in *i*) ;; *) return ;; esac
 #   $FAE_HOME/logs/     session recordings + manifest
 #   $FAE_HOME/backups/  pre-edit file backups
 #   $FAE_HOME/history/  the audit history file (see [12] below)
-: "${FAE_ENV:=prod}"                        # prod | demo | dev -> banner/prompt colour
 : "${FAE_HOME:=$HOME/.fae}"                 # single root for all tool-owned state
 : "${FAE_LOG_DIR:=$FAE_HOME/logs}"          # session recordings + manifest live here
 : "${FAE_BACKUP_DIR:=$FAE_HOME/backups}"    # pre-edit file backups
@@ -319,7 +319,7 @@ _fae_rotate() {
 _fae_housekeeping() { _fae_finalize_orphans; _fae_rotate; }
 
 # =============================================================================
-# Interactive setup: dirs, history, prompt, housekeeping, recording, banner
+# Interactive setup: dirs, history, prompt, housekeeping, recording
 # (reached only in interactive shells — see the early return at the top)
 # =============================================================================
 mkdir -p "$FAE_LOG_DIR" "$FAE_BACKUP_DIR" "$FAE_HIST_DIR" 2>/dev/null
@@ -328,14 +328,9 @@ mkdir -p "$FAE_LOG_DIR" "$FAE_BACKUP_DIR" "$FAE_HIST_DIR" 2>/dev/null
 # single HISTFILE, so the old ~/.bash_history is simply left untouched.
 HISTFILE="$FAE_HIST_DIR/bash_history"
 
-# [1] Environment banner + colour-coded prompt
-case "$FAE_ENV" in
-    prod) _fae_bg=$'\033[1;97;41m'; _fae_fg=$'\033[1;31m'; _fae_tag=' PROD · 正式機 ' ;;
-    demo) _fae_bg=$'\033[1;30;42m'; _fae_fg=$'\033[1;32m'; _fae_tag=' DEMO · 測試機 ' ;;
-    *)    _fae_bg=$'\033[1;30;43m'; _fae_fg=$'\033[1;33m'; _fae_tag=" ${FAE_ENV} " ;;
-esac
-_fae_reset=$'\033[0m'
-PS1="\[${_fae_fg}\][${FAE_ENV}]\[${_fae_reset}\] \u@\h:\w\\$ "
+# [1] Prompt — plain \u@\h:\w (already names user + machine). v0.3 dropped the
+# env banner and prompt colouring: login is silent, nothing is printed.
+PS1="\u@\h:\w\\$ "
 
 # [12] Append each command to the history file immediately (survives abrupt exit).
 case "$PROMPT_COMMAND" in
@@ -356,7 +351,7 @@ fi
 # Only the OUTER interactive login shell starts `script`. `script` spawns a new
 # bash that re-reads this file; the exported guard makes that inner shell skip
 # this block (otherwise: infinite re-exec = fork bomb). The inner shell falls
-# through to load wrappers + print the banner.
+# through to load the wrappers.
 if [[ "$FAE_RECORDING" == 1 && -z "$_FAE_REC_ACTIVE" ]]; then
     if command -v script >/dev/null 2>&1; then
         _fae_ts="$(date +%Y%m%d_%H%M%S)"
@@ -365,7 +360,6 @@ if [[ "$FAE_RECORDING" == 1 && -z "$_FAE_REC_ACTIVE" ]]; then
         mkdir -p "$_fae_sess"
         echo $$ > "$_fae_sess/.open"        # outer PID: alive while we block on `script`
         export _FAE_REC_ACTIVE=1
-        export _FAE_REC_SESSION="$_fae_sess" # visible to the inner shell's banner
         _fae_manifest OPEN "$(basename "$_fae_sess")" "recording started (pid $$)"
 
         script -q -a "$_fae_sess/rec_${_fae_tty}.log"   # blocks; inner shell is the recorded one
@@ -377,14 +371,3 @@ if [[ "$FAE_RECORDING" == 1 && -z "$_FAE_REC_ACTIVE" ]]; then
         printf '  \033[2m(recording skipped: `script` not found)\033[0m\n'
     fi
 fi
-
-# Banner — printed by the inner (recorded) shell; hostname is the machine's
-# identity (no per-site label).
-printf '\n%s%s%s  %s\n' "$_fae_bg" "$_fae_tag" "$_fae_reset" "$(hostname)"
-printf '  user=%s   data=%s\n' "$(whoami)" "$FAE_HOME"
-if [[ "$FAE_RECORDING" == 1 && -n "$_FAE_REC_ACTIVE" ]]; then
-    printf '  \033[2m(recording -> %s)\033[0m\n' "$_FAE_REC_SESSION"
-elif [[ "$FAE_RECORDING" != 1 ]]; then
-    printf '  \033[2m(terminal recording disabled: FAE_RECORDING=%s)\033[0m\n' "$FAE_RECORDING"
-fi
-printf '\n'
