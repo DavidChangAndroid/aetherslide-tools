@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# fae_bashrc  (v0.3)  — the standardized FAE ~/.bashrc, now with recording
+# fae_bashrc  (v0.4)  — the standardized FAE ~/.bashrc, input-only capture
 #
 # FAE on-site shell environment for hospital production machines. This file IS
 # the machine's ~/.bashrc: deploy by REPLACING ~/.bashrc with it, so every FAE
@@ -8,25 +8,33 @@
 #
 #     cp fae_bashrc ~/.bashrc     # (back up the old one first if it matters)
 #
-# v0.2 wires up terminal recording (merged from 專案錄影/install_recorder v5)
-# on top of v0.1's operator features + crash-proof log-lifecycle engine.
-# v0.3 drops the login banner and prompt colouring entirely — login is now
-# silent, and the prompt is a plain \u@\h:\w (which already names the machine):
-#   [4]  vi/vim/nano edit tracking (backup -> [IR-BEFORE]/[IR-DIFF]/[IR-AFTER])
-#   [12] History hardening (unlimited, timestamped, written immediately)
-#   REC  `script` recording auto-started at login, finalized as housekeeping,
-#        with ssh/su/sudo wrappers injected across hops so vi edits stay tracked.
+# v0.4 replaces v0.2/v0.3's whole-screen `script` recording with an INPUT-ONLY
+# capture model. The risk was that recording the whole pty wrote patient PHI
+# (names, MRNs, DOBs printed on screen) into the logs. v0.4 records only what
+# the FAE *did*, never what the screen *showed*:
+#   - commands.log : every command the FAE ran, timestamped (input side)
+#   - edits.log    : before/diff/after for vi/vim/nano edits + `crontab -e`,
+#                    produced by reading the FILE, not the screen
+# Command OUTPUT (query results, `cat` of a patient file, errors) is still shown
+# on the FAE's screen as normal — it is simply never written to disk.
 #
-# Design rationale & decisions: context/02-v0.2-錄影整併設計.md
+# There is NO recording of output, stderr, or full-screen program state, and NO
+# redaction engine. Residual PHI is limited to identifiers the FAE types into a
+# command themselves (e.g. `grep <MRN>`) — small, and accepted as risk. See the
+# README "隱私定位" section; an MRN is a direct identifier, not "non-PII".
 #
-# Capture model (consumer is an AI that reads the logs to draft SOPs, so the
-# bar is "is the content on disk", not "is it structured"):
-#   - Layer 1 (raw `script`): records the WHOLE screen -> nothing is missed.
-#   - Layer 2 ([IR-*] wrappers): clean before/after/diff for named-file edits,
-#     carried across ssh/su/sudo by payload injection.
-#   - Snapshot (GAP1-B): redirect writes (`>> /etc/fstab`) bypass Layer 2 and
-#     often aren't `cat`-ed, so their final state never hits the screen either.
-#     At finalize we `cat` a small list of commonly-redirected system files.
+# Design rationale & decisions:
+#   context/99-latest-v0.4-input-only-擷取模型-spec.md
+#
+# Capture seams (reuse the proven v0.3 machinery, just change the OUTPUT sink):
+#   - Commands: a PROMPT_COMMAND hook appends the last history entry to
+#     commands.log after every command. The global audit history ([12]) is
+#     unchanged.
+#   - Edits: the vi/vim/nano wrappers ([IR-*]) append straight to edits.log
+#     instead of echoing to a `script` recording.
+#   - Boundary crossing (ssh/su/sudo/docker): inject a bootstrap that sets the
+#     same two logs up on the far side, then collect them back to the
+#     originating machine's session dir.
 #
 # Compat: bash >= 4.3, Linux production hosts. Comments in English.
 # =============================================================================
@@ -40,25 +48,23 @@ case $- in *i*) ;; *) return ;; esac
 # -----------------------------------------------------------------------------
 # Everything this tool writes lives under ONE root (FAE_HOME) so it never
 # scatters dot-dirs across $HOME:
-#   $FAE_HOME/logs/     session recordings + manifest
+#   $FAE_HOME/logs/     per-session commands.log / edits.log + manifest
 #   $FAE_HOME/backups/  pre-edit file backups
 #   $FAE_HOME/history/  the audit history file (see [12] below)
 : "${FAE_HOME:=$HOME/.fae}"                 # single root for all tool-owned state
-: "${FAE_LOG_DIR:=$FAE_HOME/logs}"          # session recordings + manifest live here
+: "${FAE_LOG_DIR:=$FAE_HOME/logs}"          # session logs + manifest live here
 : "${FAE_BACKUP_DIR:=$FAE_HOME/backups}"    # pre-edit file backups
 : "${FAE_HIST_DIR:=$FAE_HOME/history}"      # audit history file lives here
 : "${FAE_RETENTION_DAYS:=365}"              # rotate: delete session dirs older than this
-: "${FAE_RECORDING:=1}"                     # 1 = auto-record the terminal at login
+: "${FAE_CAPTURE:=1}"                       # 1 = capture commands+edits (0 = plain shell)
 : "${FAE_LOG_WARN_MB:=500}"                 # warn (don't cut) if a session exceeds this
-# Snapshot list (GAP1-B): files commonly changed via shell redirection (which
-# the vi wrappers can't see). We `cat` their FINAL content at finalize. This is
-# an INCLUDE list of "also capture these", NOT an exclusion list — everything
-# is still recorded raw. Deployment configs (configs.env/.env) are edited with
-# vi and already covered by Layer 2, so they're intentionally not listed here.
+# Snapshot list (GAP1): files commonly changed via shell redirection (which the
+# vi wrappers can't see). We `cat` their FINAL content at finalize. This is the
+# final file CONTENT, not screen output, and is low-PHI system config.
 : "${FAE_SNAPSHOT_FILES:=/etc/fstab /etc/exports /etc/hosts /etc/netplan/*.yaml}"
 
 # =============================================================================
-# [12] History hardening
+# [12] History hardening  (unchanged from v0.3 — global audit trail)
 # =============================================================================
 HISTSIZE=-1                    # unlimited in-memory history
 HISTFILESIZE=-1               # unlimited on-disk history
@@ -67,39 +73,76 @@ HISTCONTROL=                   # record EVERYTHING: keep dups & space-prefixed c
 shopt -s histappend 2>/dev/null
 
 # =============================================================================
-# Remote injection payload
+# Remote/privileged/container injection payload
 #
-# base64-encoded and pushed to remote hosts on interactive SSH, and sourced
-# into su/sudo shells, so vi/vim/nano edits stay tracked across hops. Output
-# lands in the local `script` recording as [IR-*] blocks. Kept close to the
-# proven install_recorder v5 logic; identifiers aligned to the fae_* namespace.
+# base64-encoded and pushed across interactive boundaries (ssh, su/sudo,
+# docker exec -it) so the FAR side also records commands + vi edits into a
+# session dir. The caller MUST export FAE_SESSION_DIR before sourcing this:
+#   - ssh / docker : a fresh dir under the far side's /tmp (collected back on exit)
+#   - su / sudo    : the SAME local session dir (root can write it; no collection)
+# Output lands in that dir's commands.log / edits.log — never on any screen.
 # =============================================================================
 read -r -d '' _FAE_REMOTE_PAYLOAD << 'REMOTE_EOF'
-# --- fae_bashrc remote vi/vim/nano edit tracker ---
+# --- fae_bashrc injected bootstrap (input-only capture) ---
+: "${FAE_SESSION_DIR:=/tmp/.fae_sess_$$}"
+mkdir -p "$FAE_SESSION_DIR" 2>/dev/null
+# Pre-create the logs as whoever starts this shell, so a later su/sudo shell
+# only ever appends (root bypasses perms; ownership stays with this user).
+: >> "$FAE_SESSION_DIR/commands.log" 2>/dev/null; : >> "$FAE_SESSION_DIR/edits.log" 2>/dev/null
+export FAE_SESSION_DIR
+
+# Stable, timestamped, unbounded history so command extraction is reliable.
+HISTSIZE=-1; HISTFILESIZE=-1; HISTCONTROL=; export HISTSIZE HISTFILESIZE HISTCONTROL
+
+# --- command logger: append the last command (timestamped) to commands.log ---
+_fae_log_cmd() {
+    [[ -n "$FAE_SESSION_DIR" && -d "$FAE_SESSION_DIR" ]] || return 0
+    local num cmd
+    read -r num cmd <<< "$(HISTTIMEFORMAT='' builtin history 1 2>/dev/null)"
+    [[ -z "$num" ]] && return 0
+    # First fire in THIS shell only records a baseline (skips any pre-existing
+    # history entry) so injected ssh/su/docker shells never log a stale command.
+    if [[ -z "$_fae_seeded" ]]; then _fae_seeded=1; _fae_last_histn="$num"; return 0; fi
+    [[ "$num" == "$_fae_last_histn" ]] && return 0   # bare Enter → no new command
+    _fae_last_histn="$num"
+    { printf '%s  %s\n' "$(date '+%F %T' 2>/dev/null)" "$cmd" >> "$FAE_SESSION_DIR/commands.log"; } 2>/dev/null
+}
+# _fae_seeded/_fae_last_histn are intentionally NOT exported: each shell (incl.
+# injected ones) must re-baseline on its own first prompt.
+case "$PROMPT_COMMAND" in
+    *_fae_log_cmd*) : ;;
+    "")  PROMPT_COMMAND="_fae_log_cmd" ;;
+    *)   PROMPT_COMMAND="_fae_log_cmd; ${PROMPT_COMMAND}" ;;
+esac
+export PROMPT_COMMAND
+
+# --- file-edit tracker: before/diff/after into edits.log (reads the file) ---
 _fae_redit() {
     local cmd="$1"; shift
     local file=""
     for a in "$@"; do [[ "$a" != -* ]] && file="$a"; done
-    if [[ -z "$file" ]]; then command "$cmd" "$@"; return; fi
+    if [[ -z "$file" || -z "$FAE_SESSION_DIR" ]]; then command "$cmd" "$@"; return; fi
 
-    local abs dir
+    local abs dir edits="$FAE_SESSION_DIR/edits.log"
     dir="$(cd "$(dirname "$file")" 2>/dev/null && pwd)"; [[ -z "$dir" ]] && dir="$(pwd)"
     abs="${dir}/$(basename "$file")"
 
     if [[ -f "$abs" ]]; then
         local bak="/tmp/.fae_bak_${$}_$(date +%s%N 2>/dev/null || date +%s)"
-        cp -p "$abs" "$bak"
-        echo ""; echo "=== [IR-BEFORE] file=$abs ==="; cat "$abs"; echo "=== [IR-BEFORE-END] ==="
+        cp -p "$abs" "$bak" 2>/dev/null
         command "$cmd" "$@"; local rc=$?
-        echo ""; echo "=== [IR-DIFF] file=$abs ==="; diff -u "$bak" "$abs" 2>/dev/null || true; echo "=== [IR-END] ==="
-        if ! cmp -s "$bak" "$abs"; then
-            echo "=== [IR-AFTER] file=$abs ==="; cat "$abs"; echo "=== [IR-AFTER-END] ==="
-        fi
+        {
+            echo "=== [IR-BEFORE] $(date '+%F %T') file=$abs ==="; cat "$bak"; echo "=== [IR-BEFORE-END] ==="
+            echo "=== [IR-DIFF] file=$abs ==="; diff -u "$bak" "$abs" 2>/dev/null || true; echo "=== [IR-END] ==="
+            if ! cmp -s "$bak" "$abs" 2>/dev/null; then
+                echo "=== [IR-AFTER] file=$abs ==="; cat "$abs"; echo "=== [IR-AFTER-END] ==="
+            fi
+        } >> "$edits" 2>/dev/null
         rm -f "$bak"; return $rc
     else
         command "$cmd" "$@"; local rc=$?
         if [[ -f "$abs" ]]; then
-            echo ""; echo "=== [IR-NEW] file=$abs ==="; cat "$abs"; echo "=== [IR-END] ==="
+            { echo "=== [IR-NEW] $(date '+%F %T') file=$abs ==="; cat "$abs"; echo "=== [IR-END] ==="; } >> "$edits" 2>/dev/null
         fi
         return $rc
     fi
@@ -107,54 +150,82 @@ _fae_redit() {
 vi()   { _fae_redit vi   "$@"; }
 vim()  { _fae_redit vim  "$@"; }
 nano() { _fae_redit nano "$@"; }
-export -f _fae_redit vi vim nano 2>/dev/null
 
-# --- su intercept: carry wrappers into the target user's shell ---
-su() {
-    local has_c=false; for arg in "$@"; do [[ "$arg" == "-c" ]] && has_c=true; done
-    if $has_c; then command su "$@"
-    elif [[ -f /tmp/.fae_init ]]; then command su "$@" -c "source /tmp/.fae_init 2>/dev/null; exec bash"
-    else command su "$@"; fi
+# --- crontab -e before/after diff into edits.log ---
+crontab() {
+    if [[ "$1" == "-e" && -n "$FAE_SESSION_DIR" ]]; then
+        local before after edits="$FAE_SESSION_DIR/edits.log"
+        before="$(command crontab -l 2>/dev/null)"
+        command crontab "$@"; local rc=$?
+        after="$(command crontab -l 2>/dev/null)"
+        {
+            echo "=== [IR-CRON-BEFORE] $(date '+%F %T') ==="; printf '%s\n' "$before"; echo "=== [IR-CRON-BEFORE-END] ==="
+            echo "=== [IR-CRON-DIFF] ==="; diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") 2>/dev/null || true; echo "=== [IR-END] ==="
+            echo "=== [IR-CRON-AFTER] ==="; printf '%s\n' "$after"; echo "=== [IR-CRON-AFTER-END] ==="
+        } >> "$edits" 2>/dev/null
+        return $rc
+    fi
+    command crontab "$@"
 }
-export -f su 2>/dev/null
 
-# --- sudo intercept: handle 'sudo su', 'sudo -s/-i', and 'sudo vi' ---
+# --- su / sudo re-injection: carry capture into the privileged shell (same dir) ---
+su() {
+    local has_c=false a; for a in "$@"; do [[ "$a" == "-c" ]] && has_c=true; done
+    if $has_c || [[ ! -f /tmp/.fae_init ]]; then command su "$@"; return; fi
+    command su "$@" -c "export FAE_SESSION_DIR='$FAE_SESSION_DIR'; source /tmp/.fae_init 2>/dev/null; exec bash"
+}
 sudo() {
     case "$1" in
         su) shift
-            if [[ -f /tmp/.fae_init ]]; then command sudo su "$@" -c "source /tmp/.fae_init 2>/dev/null; exec bash"
+            if [[ -f /tmp/.fae_init ]]; then command sudo su "$@" -c "export FAE_SESSION_DIR='$FAE_SESSION_DIR'; source /tmp/.fae_init 2>/dev/null; exec bash"
             else command sudo su "$@"; fi; return ;;
-        -s) if [[ -f /tmp/.fae_init ]]; then command sudo bash -c "source /tmp/.fae_init 2>/dev/null; exec bash"
+        -s) if [[ -f /tmp/.fae_init ]]; then command sudo bash -c "export FAE_SESSION_DIR='$FAE_SESSION_DIR'; source /tmp/.fae_init 2>/dev/null; exec bash"
             else command sudo "$@"; fi; return ;;
-        -i) if [[ -f /tmp/.fae_init ]]; then command sudo bash -lc "source /tmp/.fae_init 2>/dev/null; exec bash -l"
+        -i) if [[ -f /tmp/.fae_init ]]; then command sudo bash -lc "export FAE_SESSION_DIR='$FAE_SESSION_DIR'; source /tmp/.fae_init 2>/dev/null; exec bash -l"
             else command sudo "$@"; fi; return ;;
         vi|vim|nano) local editor="$1"; shift
-            command sudo bash -c "source /tmp/.fae_init 2>/dev/null; _fae_redit $editor $*"; return ;;
+            command sudo bash -c "export FAE_SESSION_DIR='$FAE_SESSION_DIR'; source /tmp/.fae_init 2>/dev/null; _fae_redit $editor $*"; return ;;
         -E) case "$2" in
-                vi|vim|nano) command sudo -E bash -c "source /tmp/.fae_init 2>/dev/null; _fae_redit $2 ${*:3}"; return ;;
+                vi|vim|nano) command sudo -E bash -c "export FAE_SESSION_DIR='$FAE_SESSION_DIR'; source /tmp/.fae_init 2>/dev/null; _fae_redit $2 ${*:3}"; return ;;
             esac ;;
     esac
     command sudo "$@"
 }
-export -f sudo 2>/dev/null
-echo "[fae] vi/vim/nano edit tracking enabled"
+
+export -f _fae_log_cmd _fae_redit vi vim nano crontab su sudo 2>/dev/null
+
+# --- pack helper: the ssh host side calls this after the shell exits ---
+_fae_pack() { tar -C "$FAE_SESSION_DIR" -cf - . 2>/dev/null | base64 2>/dev/null | tr -d '\n'; }
+export -f _fae_pack 2>/dev/null
 REMOTE_EOF
 _FAE_PAYLOAD_B64="$(printf '%s' "$_FAE_REMOTE_PAYLOAD" | base64 | tr -d '\n')"
 export _FAE_PAYLOAD_B64
 
 # =============================================================================
-# [4] Local vi/vim/nano wrappers  (edits on the recording machine itself)
-#
-# Backup -> edit -> diff, emitting [IR-*] blocks into the recording. Supersedes
-# v0.1's backup-only _fae_edit. Backups go under FAE_BACKUP_DIR (one root).
+# Local capture: command logger + vi/vim/nano wrappers
+# (these run in the FAE's own login shell; edits.log/commands.log live under
+#  FAE_SESSION_DIR, set up in the interactive-setup block below)
 # =============================================================================
+_fae_log_cmd() {
+    [[ -n "$FAE_SESSION_DIR" && -d "$FAE_SESSION_DIR" ]] || return 0
+    local num cmd
+    read -r num cmd <<< "$(HISTTIMEFORMAT='' builtin history 1 2>/dev/null)"
+    [[ -z "$num" ]] && return 0
+    if [[ -z "$_fae_seeded" ]]; then _fae_seeded=1; _fae_last_histn="$num"; return 0; fi
+    [[ "$num" == "$_fae_last_histn" ]] && return 0
+    _fae_last_histn="$num"
+    { printf '%s  %s\n' "$(date '+%F %T' 2>/dev/null)" "$cmd" >> "$FAE_SESSION_DIR/commands.log"; } 2>/dev/null
+}
+
+# Backup -> edit -> before/diff/after, appended to edits.log. Local backups go
+# under FAE_BACKUP_DIR (one root); the remote twin (_fae_redit) uses /tmp.
 _fae_edit() {
     local cmd="$1"; shift
     local file=""
     for a in "$@"; do [[ "$a" != -* ]] && file="$a"; done
-    if [[ -z "$file" ]]; then command "$cmd" "$@"; return; fi
+    if [[ -z "$file" || -z "$FAE_SESSION_DIR" ]]; then command "$cmd" "$@"; return; fi
 
-    local abs dir
+    local abs dir edits="$FAE_SESSION_DIR/edits.log"
     dir="$(cd "$(dirname "$file")" 2>/dev/null && pwd)"; [[ -z "$dir" ]] && dir="$(pwd)"
     abs="${dir}/$(basename "$file")"
 
@@ -163,17 +234,19 @@ _fae_edit() {
         local safe="${abs//\//%}"
         local bak="${FAE_BACKUP_DIR}/${safe}.$(date +%Y%m%d_%H%M%S).bak"
         cp -p "$abs" "$bak" 2>/dev/null
-        echo ""; echo "=== [IR-BEFORE] file=$abs ==="; cat "$abs"; echo "=== [IR-BEFORE-END] ==="
         command "$cmd" "$@"; local rc=$?
-        echo ""; echo "=== [IR-DIFF] file=$abs ==="; diff -u "$bak" "$abs" 2>/dev/null || true; echo "=== [IR-END] ==="
-        if ! cmp -s "$bak" "$abs" 2>/dev/null; then
-            echo "=== [IR-AFTER] file=$abs ==="; cat "$abs"; echo "=== [IR-AFTER-END] ==="
-        fi
+        {
+            echo "=== [IR-BEFORE] $(date '+%F %T') file=$abs ==="; cat "$bak"; echo "=== [IR-BEFORE-END] ==="
+            echo "=== [IR-DIFF] file=$abs ==="; diff -u "$bak" "$abs" 2>/dev/null || true; echo "=== [IR-END] ==="
+            if ! cmp -s "$bak" "$abs" 2>/dev/null; then
+                echo "=== [IR-AFTER] file=$abs ==="; cat "$abs"; echo "=== [IR-AFTER-END] ==="
+            fi
+        } >> "$edits" 2>/dev/null
         return $rc
     else
         command "$cmd" "$@"; local rc=$?
         if [[ -f "$abs" ]]; then
-            echo ""; echo "=== [IR-NEW] file=$abs ==="; cat "$abs"; echo "=== [IR-END] ==="
+            { echo "=== [IR-NEW] $(date '+%F %T') file=$abs ==="; cat "$abs"; echo "=== [IR-END] ==="; } >> "$edits" 2>/dev/null
         fi
         return $rc
     fi
@@ -182,9 +255,50 @@ vi()   { _fae_edit vi   "$@"; }
 vim()  { _fae_edit vim  "$@"; }
 nano() { _fae_edit nano "$@"; }
 
-# --- Intercept ssh: inject payload on interactive connections only ---
+# --- crontab -e wrapper (local) ---
+crontab() {
+    if [[ "$1" == "-e" && -n "$FAE_SESSION_DIR" ]]; then
+        local before after edits="$FAE_SESSION_DIR/edits.log"
+        before="$(command crontab -l 2>/dev/null)"
+        command crontab "$@"; local rc=$?
+        after="$(command crontab -l 2>/dev/null)"
+        {
+            echo "=== [IR-CRON-BEFORE] $(date '+%F %T') ==="; printf '%s\n' "$before"; echo "=== [IR-CRON-BEFORE-END] ==="
+            echo "=== [IR-CRON-DIFF] ==="; diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") 2>/dev/null || true; echo "=== [IR-END] ==="
+            echo "=== [IR-CRON-AFTER] ==="; printf '%s\n' "$after"; echo "=== [IR-CRON-AFTER-END] ==="
+        } >> "$edits" 2>/dev/null
+        return $rc
+    fi
+    command crontab "$@"
+}
+
+# --- su / sudo intercept (local): carry capture into privileged shells ---
+su() {
+    local has_c=false a; for a in "$@"; do [[ "$a" == "-c" ]] && has_c=true; done
+    if $has_c || [[ ! -f /tmp/.fae_init ]]; then command su "$@"; return; fi
+    command su "$@" -c "export FAE_SESSION_DIR='$FAE_SESSION_DIR'; source /tmp/.fae_init 2>/dev/null; exec bash"
+}
+sudo() {
+    case "$1" in
+        su) shift
+            if [[ -f /tmp/.fae_init ]]; then command sudo su "$@" -c "export FAE_SESSION_DIR='$FAE_SESSION_DIR'; source /tmp/.fae_init 2>/dev/null; exec bash"
+            else command sudo su "$@"; fi; return ;;
+        -s) if [[ -f /tmp/.fae_init ]]; then command sudo bash -c "export FAE_SESSION_DIR='$FAE_SESSION_DIR'; source /tmp/.fae_init 2>/dev/null; exec bash"
+            else command sudo "$@"; fi; return ;;
+        -i) if [[ -f /tmp/.fae_init ]]; then command sudo bash -lc "export FAE_SESSION_DIR='$FAE_SESSION_DIR'; source /tmp/.fae_init 2>/dev/null; exec bash -l"
+            else command sudo "$@"; fi; return ;;
+        vi|vim|nano) local editor="$1"; shift
+            command sudo bash -c "export FAE_SESSION_DIR='$FAE_SESSION_DIR'; source /tmp/.fae_init 2>/dev/null; _fae_redit $editor $*"; return ;;
+        -E) case "$2" in
+                vi|vim|nano) command sudo -E bash -c "export FAE_SESSION_DIR='$FAE_SESSION_DIR'; source /tmp/.fae_init 2>/dev/null; _fae_redit $2 ${*:3}"; return ;;
+            esac ;;
+    esac
+    command sudo "$@"
+}
+
+# --- Intercept ssh: inject payload on interactive connections, collect on exit ---
 ssh() {
-    local args=("$@") host_found=false has_remote_cmd=false i=0
+    local args=("$@") host_found=false has_remote_cmd=false remote_host="" i=0
 
     # ssh-copy-id / sftp / scp may invoke ssh internally — never inject for them.
     local caller_cmd; caller_cmd="$(ps -o comm= -p $PPID 2>/dev/null)"
@@ -198,27 +312,135 @@ ssh() {
             -[bcDeFIiJLlmOopQRSWw]) ((i+=2)); continue ;;   # flags taking an argument
             -*)                     ((i++)); continue ;;    # boolean flags
             *)  if $host_found; then has_remote_cmd=true; break; fi
-                host_found=true; ((i++)); continue ;;
+                host_found=true; remote_host="$arg"; ((i++)); continue ;;
         esac
     done
 
     if $has_remote_cmd; then
-        command ssh "$@"                                    # non-interactive -> no inject
-    else
-        command ssh -t "$@" \
-            "echo '${_FAE_PAYLOAD_B64}' | base64 -d > /tmp/.fae_init && chmod 644 /tmp/.fae_init && source /tmp/.fae_init; exec bash -l"
+        command ssh "$@"; return                             # non-interactive -> no inject
     fi
+
+    # Interactive: set up a remote session dir, run the shell, then pack it back.
+    local rtag; rtag="$(date +%Y%m%d_%H%M%S)_$$"
+    local rsess="/tmp/.fae_sess_${rtag}"
+    local ctl="/tmp/.fae_ctl_$$"
+    local host_safe="${remote_host//[^A-Za-z0-9._-]/_}"
+    local dest="$FAE_SESSION_DIR/ssh_${host_safe}_${rtag}"
+    mkdir -p "$dest" 2>/dev/null
+
+    # Remote command: seed /tmp/.fae_init, run the login shell, pack on exit.
+    # NOTE: we do NOT `exec` bash so that `_fae_pack` runs after the user logs out.
+    local rcmd="echo '${_FAE_PAYLOAD_B64}' | base64 -d > /tmp/.fae_init && chmod 600 /tmp/.fae_init"
+    rcmd="$rcmd && export FAE_SESSION_DIR='$rsess' && source /tmp/.fae_init; bash -l; _fae_pack > /tmp/.fae_pack.b64 2>/dev/null"
+
+    command ssh -t \
+        -o ControlMaster=auto -o ControlPath="$ctl" -o ControlPersist=15 \
+        "$@" "$rcmd"
+
+    # Collect the remote logs back. Prefer the multiplexed master (no re-auth);
+    # fall back to a fresh connection (which may prompt for a password).
+    local fetch="cat /tmp/.fae_pack.b64 2>/dev/null; rm -f /tmp/.fae_pack.b64 /tmp/.fae_init 2>/dev/null; rm -rf '$rsess' 2>/dev/null"
+    if command ssh -o ControlPath="$ctl" -O check "$@" 2>/dev/null; then
+        command ssh -o ControlPath="$ctl" "$@" "$fetch" | base64 -d 2>/dev/null | tar -C "$dest" -xf - 2>/dev/null
+        command ssh -o ControlPath="$ctl" -O exit "$@" 2>/dev/null
+    else
+        echo "[fae] 正在把遠端操作紀錄撈回本機 session（多工重用不可用，可能需再輸入一次密碼）…" >&2
+        command ssh "$@" "$fetch" | base64 -d 2>/dev/null | tar -C "$dest" -xf - 2>/dev/null
+    fi
+    # If nothing was collected, drop the empty dir so it doesn't clutter.
+    rmdir "$dest" 2>/dev/null || true
 }
 ssh-copy-id() { command ssh-copy-id "$@"; }
+
+# --- Intercept docker: inject into interactive `exec -it ... bash|sh`; Django REPL ---
+# One-shot `docker exec c <cmd>` (incl. `dj admin <cmd>` and `... shell -c`) is a
+# single outer command already captured in commands.log — pass it straight
+# through. Only interactive shells and the bare `dj admin shell` REPL need the
+# in-container bootstrap + docker-cp collection.
+docker() {
+    local argv=("$@") base=0
+    [[ "${argv[0]}" == "compose" ]] && base=1        # cover `docker compose exec` / bin/dc
+    if [[ "${argv[$base]}" != "exec" ]]; then command docker "$@"; return; fi
+
+    # Parse the exec: interactivity, container ref, in-container command.
+    local interactive=false container="" j=$((base+1)) n=${#argv[@]}
+    local pre=("${argv[@]:0:$((base+1))}")           # e.g. (exec) or (compose exec)
+    local flags=() cmdwords=()
+    while (( j < n )); do
+        local a="${argv[$j]}"
+        case "$a" in
+            -i|-t|-it|-ti|--interactive|--tty) [[ "$a" == *t* || "$a" == "--tty" ]] && interactive=true
+                                               flags+=("$a"); ((j++)) ;;
+            -e|-u|-w|--env|--user|--workdir)   flags+=("$a" "${argv[$((j+1))]}"); ((j+=2)) ;;
+            -*)                                flags+=("$a"); ((j++)) ;;
+            *)                                 container="$a"; ((j++)); break ;;
+        esac
+    done
+    while (( j < n )); do cmdwords+=("${argv[$j]}"); ((j++)); done
+
+    # Only interactive execs are candidates; everything else is a one-shot.
+    if ! $interactive; then command docker "$@"; return; fi
+
+    local ncw=${#cmdwords[@]}
+    local last="${cmdwords[$((ncw-1))]:-}"
+    local first="${cmdwords[0]:-}"
+    local has_c=false w; for w in "${cmdwords[@]}"; do [[ "$w" == "-c" ]] && has_c=true; done
+
+    local rtag; rtag="$(date +%Y%m%d_%H%M%S)_$$"
+
+    # (A) Bare interactive shell: docker exec -it c bash|sh  -> full bootstrap.
+    if [[ $ncw -le 2 && ( "$first" == "bash" || "$first" == "sh" ) ]]; then
+        local dest="$FAE_SESSION_DIR/docker_${container//[^A-Za-z0-9._-]/_}_${rtag}"
+        mkdir -p "$dest" 2>/dev/null
+        local csess="/tmp/.fae_sess"
+        local rcmd="echo '${_FAE_PAYLOAD_B64}' | base64 -d > /tmp/.fae_init && export FAE_SESSION_DIR='$csess' && source /tmp/.fae_init; exec bash"
+        command docker "${pre[@]}" "${flags[@]}" "$container" bash -c "$rcmd"
+        _fae_docker_collect "$base" "$container" "$csess/." "$dest"
+        rmdir "$dest" 2>/dev/null || true
+        return
+    fi
+
+    # (B) Django interactive REPL: `... admin shell` with no -c -> IPython history.
+    #     Spike (2026-07-23, demo1) confirmed dj admin shell -> IPython, and with
+    #     a tty IPYTHONDIR captures each input line into history.sqlite.
+    if ! $has_c && [[ "$last" == "shell" ]]; then
+        local dest="$FAE_SESSION_DIR/djshell_${container//[^A-Za-z0-9._-]/_}_${rtag}"
+        mkdir -p "$dest" 2>/dev/null
+        command docker "${pre[@]}" "${flags[@]}" \
+            -e IPYTHONDIR=/tmp/.fae_ipy -e PYTHONSTARTUP=/tmp/.fae_py \
+            "$container" "${cmdwords[@]}"
+        _fae_docker_collect "$base" "$container" "/tmp/.fae_ipy/profile_default/history.sqlite" "$dest"
+        rmdir "$dest" 2>/dev/null || true
+        return
+    fi
+
+    # (C) Other interactive exec (e.g. mysql, python one-off): pass through.
+    command docker "$@"
+}
+
+# Copy $src (a path inside $container) out to local $dest. Uses `docker cp` for a
+# plain container, `docker compose cp` when the exec was `docker compose exec`.
+_fae_docker_collect() {
+    local base="$1" container="$2" src="$3" dest="$4"
+    if [[ "$base" == 1 ]]; then
+        command docker compose cp "${container}:${src}" "$dest/" 2>/dev/null
+    else
+        command docker cp "${container}:${src}" "$dest/" 2>/dev/null
+    fi
+}
 
 # =============================================================================
 # Log-lifecycle engine
 #
 #   $FAE_LOG_DIR/session_<ts>_<tty>/
-#     rec_<tty>.log   raw `script` recording
-#     .open           recording-in-progress marker; contains the outer shell PID
-# Finalize = strip ANSI, extract [IR-*], snapshot redirect-prone files, warn on
-# size, gzip, clean /tmp, drop .open, note in manifest. Idempotent, crash-safe.
+#     commands.log   every command run this session, timestamped (input side)
+#     edits.log      before/diff/after for vi/crontab edits (read from files)
+#     ssh_*/ docker_*/ djshell_*/   logs collected back from boundary hops
+#     snapshot/      final content of redirect-prone files (GAP1)
+#     .open          in-progress marker; contains the owning shell PID
+# Finalize = snapshot, size warn, clean this shell's /tmp bits, drop .open, note
+# manifest. commands.log/edits.log append live, so they're crash-safe already.
+# Idempotent: a session with no .open is treated as already finalized.
 # =============================================================================
 _FAE_MANIFEST="${FAE_LOG_DIR}/manifest.log"
 
@@ -228,7 +450,7 @@ _fae_manifest() {
     printf '%s  %-8s  %-40s  %s\n' "$(date '+%F %T')" "$1" "$2" "$3" >> "$_FAE_MANIFEST"
 }
 
-# GAP1-B: capture the FINAL content of redirect-prone files the vi layer misses.
+# GAP1: capture the FINAL content of redirect-prone files the vi layer misses.
 _fae_snapshot() {
     local dir="$1" snap="$1/snapshot" f content
     mkdir -p "$snap" 2>/dev/null
@@ -242,7 +464,7 @@ _fae_snapshot() {
             printf '[unreadable without interactive sudo]\n' > "$snap/${safe}.txt"
         fi
     done
-    if crontab -l >"$snap/crontab.txt" 2>/dev/null; then n=$((n + 1)); else rm -f "$snap/crontab.txt"; fi
+    if command crontab -l >"$snap/crontab.txt" 2>/dev/null; then n=$((n + 1)); else rm -f "$snap/crontab.txt"; fi
     [[ "$n" -gt 0 ]] || rmdir "$snap" 2>/dev/null
     return 0
 }
@@ -250,51 +472,31 @@ _fae_snapshot() {
 _fae_finalize_session() {
     local dir="$1"
     [[ -d "$dir" ]] || return 0
+    [[ -f "$dir/.open" ]] || return 0          # no .open == already finalized (idempotent)
 
-    # 1+2. Merge raw logs and strip ANSI (Linux sed).
-    local merged="${dir}/merged.log" f
-    if compgen -G "$dir"/rec_*.log >/dev/null 2>&1; then
-        cat "$dir"/rec_*.log > "$merged" 2>/dev/null
-        LC_ALL=C sed -i $'s/\x1b\[[0-9;]*[a-zA-Z]//g'   "$merged" 2>/dev/null
-        LC_ALL=C sed -i $'s/\x1b\][^\x07]*\x07//g'      "$merged" 2>/dev/null
-        LC_ALL=C sed -i $'s/\x1b\[[?][0-9;]*[a-zA-Z]//g' "$merged" 2>/dev/null
-        LC_ALL=C sed -i $'s/\x1b(B//g'                  "$merged" 2>/dev/null
-        LC_ALL=C sed -i $'s/\x1b[=>]//g'                "$merged" 2>/dev/null
-        LC_ALL=C sed -i $'s/\r//g'                      "$merged" 2>/dev/null
-    fi
-
-    # 3. Extract [IR-*] edit blocks.
-    local edits="${dir}/edits.log" ec=0
-    if [[ -f "$merged" ]]; then
-        awk '/^=== \[IR-(DIFF|NEW|BEFORE|AFTER)\]/{f=1} f{print} /^=== \[IR-(END|BEFORE-END|AFTER-END)\]/{f=0}' \
-            "$merged" > "$edits" 2>/dev/null
-        ec=$(grep -c '^=== \[IR-DIFF\]\|^=== \[IR-NEW\]' "$edits" 2>/dev/null || echo 0)
-    fi
-
-    # 4. Snapshot redirect-prone files (GAP1-B).
+    # 1. Snapshot redirect-prone files (GAP1).
     _fae_snapshot "$dir"
 
-    # 5. Size warning (GAP2) — warn, never cut.
+    # 2. Size warning (GAP2) — warn, never cut. (Input-only logs are tiny; this
+    #    mainly guards against a runaway collected hop.)
     local mb; mb=$(du -m "$dir" 2>/dev/null | tail -1 | awk '{print $1}')
     if [[ -n "$mb" && "$mb" -ge "$FAE_LOG_WARN_MB" ]]; then
         _fae_manifest WARN "$(basename "$dir")" "session size ${mb}MB >= ${FAE_LOG_WARN_MB}MB"
     fi
 
-    # 6. gzip raw + merged (keep edits.log plaintext for quick reading).
-    local n=0
-    for f in "$dir"/rec_*.log "$merged"; do
-        [[ -e "$f" ]] || continue
-        gzip -f "$f" 2>/dev/null && n=$((n + 1))
-    done
+    # 3. Clean this shell's own /tmp bits (leave /tmp/.fae_init: other live
+    #    sessions on this host may still need it; it's rewritten each login).
+    rm -f "/tmp/.fae_pack.b64" "/tmp/.fae_ctl_${$}" "/tmp/.fae_bak_${$}"* 2>/dev/null
 
-    # 7. Clean this shell's own /tmp injection artifacts.
-    rm -f /tmp/.fae_init "/tmp/.fae_bak_${$}"* 2>/dev/null
+    local cc ec
+    cc=$(wc -l < "$dir/commands.log" 2>/dev/null | tr -d ' '); : "${cc:=0}"
+    ec=$(grep -c '^=== \[IR-DIFF\]\|^=== \[IR-NEW\]\|^=== \[IR-CRON-DIFF\]' "$dir/edits.log" 2>/dev/null || echo 0)
 
     rm -f "$dir/.open"
-    _fae_manifest FINALIZE "$(basename "$dir")" "gzipped ${n}, edits ${ec}"
+    _fae_manifest FINALIZE "$(basename "$dir")" "commands ${cc}, edits ${ec}"
 }
 
-# Finalize sessions a previous login left open, unless their recorder is alive.
+# Finalize sessions a previous login left open, unless their shell is alive.
 _fae_finalize_orphans() {
     local dir pid
     for dir in "$FAE_LOG_DIR"/session_*/; do
@@ -319,7 +521,7 @@ _fae_rotate() {
 _fae_housekeeping() { _fae_finalize_orphans; _fae_rotate; }
 
 # =============================================================================
-# Interactive setup: dirs, history, prompt, housekeeping, recording
+# Interactive setup: dirs, history, prompt, housekeeping, session start
 # (reached only in interactive shells — see the early return at the top)
 # =============================================================================
 mkdir -p "$FAE_LOG_DIR" "$FAE_BACKUP_DIR" "$FAE_HIST_DIR" 2>/dev/null
@@ -328,46 +530,50 @@ mkdir -p "$FAE_LOG_DIR" "$FAE_BACKUP_DIR" "$FAE_HIST_DIR" 2>/dev/null
 # single HISTFILE, so the old ~/.bash_history is simply left untouched.
 HISTFILE="$FAE_HIST_DIR/bash_history"
 
-# [1] Prompt — plain \u@\h:\w (already names user + machine). v0.3 dropped the
-# env banner and prompt colouring: login is silent, nothing is printed.
+# [1] Prompt — plain \u@\h:\w (already names user + machine). Silent login.
 PS1="\u@\h:\w\\$ "
 
-# [12] Append each command to the history file immediately (survives abrupt exit).
-case "$PROMPT_COMMAND" in
-    *"history -a"*) : ;;
-    "")  PROMPT_COMMAND="history -a" ;;
-    *)   PROMPT_COMMAND="history -a; ${PROMPT_COMMAND}" ;;
-esac
+# Skip all capture when disabled — behaves like a plain, silent bashrc.
+if [[ "$FAE_CAPTURE" != 1 ]]; then
+    case "$PROMPT_COMMAND" in *"history -a"*) : ;; "") PROMPT_COMMAND="history -a" ;; *) PROMPT_COMMAND="history -a; ${PROMPT_COMMAND}" ;; esac
+    return
+fi
 
-# Login housekeeping — run once per login, in the OUTER shell before recording
-# starts (so it isn't captured into the recording). Inherited flag makes the
-# inner recorded shell skip it.
+# Make the generic injection payload available on disk for su/sudo/ssh/docker.
+printf '%s' "$_FAE_PAYLOAD_B64" | base64 -d > /tmp/.fae_init 2>/dev/null && chmod 600 /tmp/.fae_init 2>/dev/null
+
+# Login housekeeping — finalize orphaned sessions + rotate. Run once per login
+# (the exported guard makes nested `bash` shells skip it).
 if [[ -z "$_FAE_HOUSEKEPT" ]]; then
     export _FAE_HOUSEKEPT=1
     _fae_housekeeping
 fi
 
-# --- Recording bootstrap ---------------------------------------------------
-# Only the OUTER interactive login shell starts `script`. `script` spawns a new
-# bash that re-reads this file; the exported guard makes that inner shell skip
-# this block (otherwise: infinite re-exec = fork bomb). The inner shell falls
-# through to load the wrappers.
-if [[ "$FAE_RECORDING" == 1 && -z "$_FAE_REC_ACTIVE" ]]; then
-    if command -v script >/dev/null 2>&1; then
-        _fae_ts="$(date +%Y%m%d_%H%M%S)"
-        _fae_tty="$(tty 2>/dev/null | sed 's|.*/||; s|[^A-Za-z0-9]|_|g')"; : "${_fae_tty:=pid$$}"
-        _fae_sess="$FAE_LOG_DIR/session_${_fae_ts}_${_fae_tty}"
-        mkdir -p "$_fae_sess"
-        echo $$ > "$_fae_sess/.open"        # outer PID: alive while we block on `script`
-        export _FAE_REC_ACTIVE=1
-        _fae_manifest OPEN "$(basename "$_fae_sess")" "recording started (pid $$)"
-
-        script -q -a "$_fae_sess/rec_${_fae_tty}.log"   # blocks; inner shell is the recorded one
-
-        # Reached only on a clean logout (inner shell exited): finalize now.
-        _fae_finalize_session "$_fae_sess"
-        exit
-    else
-        printf '  \033[2m(recording skipped: `script` not found)\033[0m\n'
-    fi
+# Session dir. The OWNING login shell creates it and owns finalize; nested
+# `bash` shells inherit FAE_SESSION_DIR and log into the SAME dir but neither
+# re-create it nor finalize it (guarded by _FAE_SESSION_ACTIVE / owner PID).
+if [[ -z "$_FAE_SESSION_ACTIVE" ]]; then
+    _fae_ts="$(date +%Y%m%d_%H%M%S)"
+    _fae_tty="$(tty 2>/dev/null | sed 's|.*/||; s|[^A-Za-z0-9]|_|g')"; : "${_fae_tty:=pid$$}"
+    export FAE_SESSION_DIR="$FAE_LOG_DIR/session_${_fae_ts}_${_fae_tty}"
+    export _FAE_SESSION_ACTIVE=1
+    export _FAE_OWNER_PID=$$
+    mkdir -p "$FAE_SESSION_DIR"
+    # Pre-create logs as the login user so a later su/sudo shell only appends
+    # (root bypasses perms; ownership stays with the user → no perm-denied spam).
+    : >> "$FAE_SESSION_DIR/commands.log" 2>/dev/null; : >> "$FAE_SESSION_DIR/edits.log" 2>/dev/null
+    echo $$ > "$FAE_SESSION_DIR/.open"          # owning PID: alive == session live
+    _fae_manifest OPEN "$(basename "$FAE_SESSION_DIR")" "session started (pid $$)"
+    # Clean logout: finalize best-effort. Crash/disconnect: next login's
+    # _fae_finalize_orphans picks it up (both paths are idempotent).
+    trap '[[ "$$" == "$_FAE_OWNER_PID" ]] && _fae_finalize_session "$FAE_SESSION_DIR"' EXIT
 fi
+
+# [12] Command capture + immediate history append. _fae_log_cmd self-baselines
+# on its first fire (see its definition), so the pre-existing last history entry
+# is never re-logged — no explicit seeding needed here.
+case "$PROMPT_COMMAND" in
+    *_fae_log_cmd*) : ;;
+    "")  PROMPT_COMMAND="history -a; _fae_log_cmd" ;;
+    *)   PROMPT_COMMAND="history -a; _fae_log_cmd; ${PROMPT_COMMAND}" ;;
+esac
