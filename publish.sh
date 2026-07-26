@@ -16,17 +16,21 @@ set -euo pipefail
 
 REPO="DavidChangAndroid/aetherslide-tools"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VAULT_ROOT="/Users/davidchang/Library/Mobile Documents/iCloud~md~obsidian/Documents/iCloud_Obsidian/雲象科技/08_工具與設定/小工具"
+OBSIDIAN_ROOT="/Users/davidchang/Library/Mobile Documents/iCloud~md~obsidian/Documents/iCloud_Obsidian/雲象科技"
+VAULT_ROOT="$OBSIDIAN_ROOT/08_工具與設定/小工具"
 
-# 工具設定:repo 子目錄名 → 正本庫資料夾名 / 檔名前綴
+# 工具設定:repo 子目錄名 → 正本資料夾 / 檔名前綴
 # 新增工具時在這裡加一行即可。
+# 值可以是 VAULT_ROOT(08_工具與設定/小工具)底下的資料夾名,
+# 也可以是**絕對路徑**——正本跟著專案走、不在小工具庫的工具用這種。
 vault_dir_for() {
   case "$1" in
     set_configs)      echo "aetherSlideAutoConfig" ;;
     install_recorder) echo "專案錄影" ;;
     chrome_debug)     echo "Chrome_debug" ;;
     fae_bashrc)       echo "FAE_bashrc" ;;
-    site_config_collector) echo "site_config_collector" ;;
+    # 正本跟著「客戶 site config 紀錄」專案走,不在小工具庫
+    site_config_collector) echo "$OBSIDIAN_ROOT/02_技術產品/專案/客戶 site_config 紀錄/採集腳本" ;;
     *) echo "" ;;
   esac
 }
@@ -54,8 +58,11 @@ if [[ -z "$vdir" || -z "$prefix" ]]; then
   exit 1
 fi
 
-src_dir="$VAULT_ROOT/$vdir"
-[[ -d "$src_dir" ]] || { echo "✗ 找不到正本庫資料夾: $src_dir" >&2; exit 1; }
+case "$vdir" in
+  /*) src_dir="$vdir" ;;            # 絕對路徑:正本不在小工具庫(跟著專案走)
+  *)  src_dir="$VAULT_ROOT/$vdir" ;;
+esac
+[[ -d "$src_dir" ]] || { echo "✗ 找不到正本資料夾: $src_dir" >&2; exit 1; }
 
 # 找版號最大的檔案:<prefix>V<版號>.sh
 latest_file="$(ls "$src_dir/${prefix}V"*.sh 2>/dev/null | sort -V | tail -1 || true)"
@@ -90,7 +97,7 @@ if gh release view "$vtag" -R "$REPO" >/dev/null 2>&1; then
 else
   gh release create "$vtag" "$dest" -R "$REPO" \
     --title "${tool} v${version}" \
-    --notes "正本庫: 08_工具與設定/小工具/${vdir}/$(basename "$latest_file")"
+    --notes "正本: ${src_dir#$OBSIDIAN_ROOT/}/$(basename "$latest_file")"
   echo "→ 已建立固定版 release: $vtag"
 fi
 
