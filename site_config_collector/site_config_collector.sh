@@ -110,11 +110,26 @@ if have ip; then
 else
   note "無 ip 指令"
 fi
-# 濾掉 docker 生出來的虛擬網卡(veth*、br-<id>、docker0、vnet*),
-# 有跑 aetherSlide 的站台會有幾十個 veth,會把真正的實體網卡淹掉。
-printf '### 所有介面(已濾掉 docker 虛擬網卡)\n```\n'
+# 介面過濾(v1.4):純黑名單擋不住沒列到的名字(k8s 的 cali*、kernel 的 ip_vti0…),
+# 純白名單又會誤殺 br0 / bond0 / vlan 這些沒有實體裝置的主介面。所以用兩層:
+#   第一層(正向):留下「有實體裝置」或「有 IPv4」的 —— veth pair、cali*、ip_vti0
+#                  兩者皆非,不必知道名字就會被擋掉;DOWN 但存在的實體網卡會留著
+#                  (「有第二張網卡沒接線」是交接時要知道的事)。
+#   第二層(反向):再擋掉「有 IP 但屬於容器 / 虛擬化橋接」的那一小類。
+printf '### 網路介面(已濾掉容器與虛擬網卡)\n```\n'
 if have ip; then
-  ip -brief addr 2>/dev/null | grep -vE '^(veth|br-[0-9a-f]{6,}|docker[0-9]|vnet)'
+  for _if in /sys/class/net/*; do
+    _n="$(basename "$_if")"
+    [ "$_n" = "lo" ] && continue
+    case "$_n" in
+      docker*|cni*|flannel*|kube-ipvs*|virbr*|mpqemubr*|lxdbr*|lxcbr*|podman*) continue ;;
+    esac
+    printf '%s' "$_n" | grep -qE '^br-[0-9a-f]{6,}$' && continue   # docker 自建 bridge
+    if [ -e "$_if/device" ] ||
+       ip -4 -brief addr show "$_n" 2>/dev/null | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
+      ip -brief addr show "$_n" 2>/dev/null
+    fi
+  done
 fi
 printf '```\n### DNS\n```\n'
 grep -E '^nameserver' /etc/resolv.conf 2>/dev/null || note "讀不到 resolv.conf"
@@ -254,15 +269,23 @@ fi
 
 # ── 5. 對接與整合設定(從 configs.env 讀,不含任何密碼類鍵)─────────────
 sec "5. 對接與整合設定"
+# v1.5:configs.env 裡的 DICOM / HL7 等鍵就算沒用到也會有預設值,
+# 模組沒列在 MODULES 裡就代表那個服務根本沒起、設定不生效 —— 不註明會讓人以為有對接。
+MODULES_VAL="$(envval "$DEPLOY_DIR/configs.env" MODULES | tr -d ' ')"
+mod_off() {   # 模組不在 MODULES 裡就回傳提示字串
+  if printf '%s' ",$MODULES_VAL," | grep -q ",$1,"; then printf ''
+  else printf '(%s 模組未啟用,此設定不生效)' "$1"; fi
+}
 if [ -f "$DEPLOY_DIR/configs.env" ]; then
-  kv "DICOM AE Title" "$(envval "$DEPLOY_DIR/configs.env" WEB_DICOM_SCP__AE_TITLE)"
-  kv "DICOM SCP 使用者" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__DICOM_SCP_USER)"
-  kv "HL7v2 訊息編碼" "$(envval "$DEPLOY_DIR/configs.env" WEB_HL7V2_SERVER__MESSAGE_CODEC)"
+  kv "啟用的模組 MODULES" "${MODULES_VAL:-(空)}"
+  kv "DICOM AE Title" "$(envval "$DEPLOY_DIR/configs.env" WEB_DICOM_SCP__AE_TITLE)$(mod_off dicom)"
+  kv "DICOM SCP 使用者" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__DICOM_SCP_USER)$(mod_off dicom)"
+  kv "HL7v2 訊息編碼" "$(envval "$DEPLOY_DIR/configs.env" WEB_HL7V2_SERVER__MESSAGE_CODEC)$(mod_off hl7v2)"
   kv "LDAP 整合" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__LDAP_INTEGRATION)(1=開)"
   kv "LDAP server" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__LDAP_SERVER_URL)"
   kv "LDAP bind domain" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__LDAP_BIND_DOMAIN)"
   kv "aetherAI LDAP 登入" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__ENABLE_AETHERAI_LDAP_LOGIN)(1=開)"
-  kv "自動匯入 AUTO_IMPORT" "$(envval "$DEPLOY_DIR/configs.env" AUTO_IMPORT_ENABLED)(1=開),路徑 $(envval "$DEPLOY_DIR/configs.env" AUTO_IMPORT_PATH)"
+  kv "自動匯入 AUTO_IMPORT" "$(envval "$DEPLOY_DIR/configs.env" AUTO_IMPORT_ENABLED)(1=開),路徑 $(envval "$DEPLOY_DIR/configs.env" AUTO_IMPORT_PATH)$(mod_off auto-import)"
   kv "分層儲存 GIGASTORE_ENABLE_TIERING" "$(envval "$DEPLOY_DIR/configs.env" GIGASTORE_ENABLE_TIERING)(1=開)"
   kv "匯出路徑" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__EXPORT_PATH)"
   kv "NDPI 匯入時轉 DICOM" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__CONVERT_NDPI_TO_DICOM_ON_IMPORT)(1=開)"
