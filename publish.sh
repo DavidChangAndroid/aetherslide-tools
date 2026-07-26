@@ -26,6 +26,7 @@ vault_dir_for() {
     install_recorder) echo "專案錄影" ;;
     chrome_debug)     echo "Chrome_debug" ;;
     fae_bashrc)       echo "FAE_bashrc" ;;
+    site_config_collector) echo "site_config_collector" ;;
     *) echo "" ;;
   esac
 }
@@ -35,6 +36,7 @@ file_prefix_for() {
     install_recorder) echo "install_recorder" ;;
     chrome_debug)     echo "chrome_debug" ;;
     fae_bashrc)       echo "fae_bashrc" ;;
+    site_config_collector) echo "collect_site_config" ;;
     *) echo "" ;;
   esac
 }
