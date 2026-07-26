@@ -110,8 +110,12 @@ if have ip; then
 else
   note "無 ip 指令"
 fi
-printf '### 所有介面(參考,多網卡時用)\n```\n'
-if have ip; then ip -brief addr 2>/dev/null; fi
+# 濾掉 docker 生出來的虛擬網卡(veth*、br-<id>、docker0、vnet*),
+# 有跑 aetherSlide 的站台會有幾十個 veth,會把真正的實體網卡淹掉。
+printf '### 所有介面(已濾掉 docker 虛擬網卡)\n```\n'
+if have ip; then
+  ip -brief addr 2>/dev/null | grep -vE '^(veth|br-[0-9a-f]{6,}|docker[0-9]|vnet)'
+fi
 printf '```\n### DNS\n```\n'
 grep -E '^nameserver' /etc/resolv.conf 2>/dev/null || note "讀不到 resolv.conf"
 printf '```\n'
@@ -126,6 +130,11 @@ if [ -f "$CERT" ] && have openssl; then
   kv "Subject" "$(openssl x509 -in "$CERT" -noout -subject 2>/dev/null | sed 's/^subject=//')"
   kv "SAN" "$(openssl x509 -in "$CERT" -noout -ext subjectAltName 2>/dev/null | grep -v 'X509v3' | tr -s ' ')"
   kv "到期" "$(openssl x509 -in "$CERT" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+elif printf '%s' "$(envval "$DEPLOY_DIR/configs.env" MODULES)" | grep -q caddy ||
+     { have docker && docker ps --format '{{.Names}}' 2>/dev/null | grep -q caddy; }; then
+  # 啟用 caddy 的站台憑證由 caddy 自己申請與續約,不會放在 data/ssl
+  kv "憑證管理方式" "caddy(ACME 自動申請 / 續約),不在 $DEPLOY_DIR/data/ssl"
+  note "憑證細節要進 caddy 容器或看 caddy 資料目錄,本腳本不進容器"
 else
   note "找不到 $CERT 或無 openssl(非標準路徑請自行指定)"
 fi
@@ -198,7 +207,12 @@ kv "部署目錄" "$DEPLOY_DIR"
 # 兩者不一致 = 改了 TAG 但沒重建。hotfix / 客製版仍要人工補註記。
 kv "aetherSlide 版本 TAG(設定值)" "$(envval "$DEPLOY_DIR/.env" TAG)"
 if have docker; then
-  RUNNING_TAG="$(docker ps --format '{{.Image}}' 2>/dev/null | sed -n 's/.*:\([^:]*\)$/\1/p' | sort -u | paste -sd ', ' -)"
+  # 只看自家 registry 的 image;redis 等第三方 image 的 tag 不是 aetherSlide 版本
+  RUNNING_TAG="$(docker ps --format '{{.Image}}' 2>/dev/null | grep -i aetherai |
+    sed -n 's/.*:\([^:]*\)$/\1/p' | sort -u | paste -sd ', ' -)"
+  if [ -z "$RUNNING_TAG" ] && docker ps -q 2>/dev/null | grep -q .; then
+    RUNNING_TAG="$(docker ps --format '{{.Image}}' 2>/dev/null | sed -n 's/.*:\([^:]*\)$/\1/p' | sort -u | paste -sd ', ' -)(非自家 registry,請確認)"
+  fi
   kv "實際執行中的 image tag" "${RUNNING_TAG:-(無執行中 container)}"
 fi
 kv "SITE_NAME(站台代號)" "$(envval "$DEPLOY_DIR/configs.env" SITE_NAME)"
@@ -213,16 +227,28 @@ if [ -d "$DEPLOY_DIR" ]; then
 else
   note "部署目錄不存在:$DEPLOY_DIR"
 fi
+# 站台有幾十個容器,不健康的會混在清單裡看不到,所以先單獨拉出來當警示
+if have docker; then
+  BAD="$(docker ps --format '{{.Names}}\t{{.Status}}' 2>/dev/null |
+    grep -iE 'restarting|unhealthy|health: starting|created|paused')"
+  printf '### 狀態不正常的 container(先看這個)\n'
+  if [ -n "$BAD" ]; then
+    printf '```\n%s\n```\n' "$BAD"
+    printf -- '- _重啟中 / unhealthy 代表這個服務現在是壞的,交接時要問清楚原因_\n'
+  else
+    printf -- '- 無狀態異常的 container\n'
+  fi
+fi
 printf '### 執行中 container(名稱 / image / 狀態 / 對外 port)\n```\n'
 if have docker; then
   docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || note "docker ps 失敗(權限?)"
 else note "無 docker"; fi
 printf '```\n'
-# 停掉的容器代表「本來該跑但沒跑」,交接時很重要,只列最近 15 個
+# 只列最近 15 個。Exited (0) 多半是 init / volume 準備之類的一次性容器,屬正常
 if have docker; then
   STOPPED="$(docker ps -a --filter 'status=exited' --filter 'status=dead' \
     --format '{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null | head -15)"
-  printf '### 已停止的 container(該跑而沒跑的?)\n'
+  printf '### 已停止的 container(Exited 0 多半是一次性初始化,非 0 才要追)\n'
   if [ -n "$STOPPED" ]; then printf '```\n%s\n```\n' "$STOPPED"; else printf -- '- 無\n'; fi
 fi
 
