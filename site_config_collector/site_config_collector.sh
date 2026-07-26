@@ -115,14 +115,8 @@ if have ip; then ip -brief addr 2>/dev/null; fi
 printf '```\n### DNS\n```\n'
 grep -E '^nameserver' /etc/resolv.conf 2>/dev/null || note "讀不到 resolv.conf"
 printf '```\n'
-# aetherSlide 是標準 HTTPS(80/443),不列完整 listen 清單;只挑「標準以外、綁在 0.0.0.0/:: 的對外 port」當例外提醒
-sec "非標準對外 port(例外提醒)"
-if have ss; then
-  EXTRA="$(ss -tlnH 2>/dev/null | awk '{print $4}' | grep -E '^(0\.0\.0\.0|\[::\]|\*):' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un | grep -vE '^(22|80|443)$')"
-  if [ -n "$EXTRA" ]; then printf '```\n%s\n```\n' "$EXTRA"; else printf -- '- 無(僅標準 22/80/443)\n'; fi
-else
-  note "無 ss"
-fi
+# v1.2 起不再列 listen port:實測抓到的幾乎都是 NFS/RPC 動態高位 port 與跳板服務,
+# 對交接沒幫助,反而要人去分辨雜訊。對外開放哪些 port 以防火牆規則為準,人工填。
 
 # ── SSL 憑證 ──
 sec "SSL 憑證"
@@ -180,13 +174,33 @@ printf '```\n'
 if [ -f /proc/mdstat ] && grep -q '^md' /proc/mdstat 2>/dev/null; then
   printf '### RAID(mdstat)\n```\n'; cat /proc/mdstat 2>/dev/null; printf '```\n'
 fi
+# LVM:vgs/lvs 非 root 會把警告丟到 stderr、stdout 留空,看起來像「這台沒有 LVM」。
+# 所以要分辨「真的沒有」與「沒權限」,--with-sudo 時再試一次。
 if have vgs; then
-  printf '### LVM\n```\n'; vgs 2>/dev/null; lvs 2>/dev/null; printf '```\n'
+  LVM_OUT="$(vgs 2>/dev/null; lvs 2>/dev/null)"
+  if [ -z "$LVM_OUT" ] && [ "$WITH_SUDO" = "1" ]; then
+    LVM_OUT="$(sudo -n vgs 2>/dev/null; sudo -n lvs 2>/dev/null)"
+  fi
+  printf '### LVM\n'
+  if [ -n "$LVM_OUT" ]; then
+    printf '```\n%s\n```\n' "$LVM_OUT"
+  elif lsblk -o FSTYPE 2>/dev/null | grep -q LVM2_member; then
+    note "偵測到 LVM2_member 分割,但 vgs/lvs 需要 root 才讀得到(可加 --with-sudo,或人工確認)"
+  else
+    printf -- '- 無 LVM\n'
+  fi
 fi
 
 # ── 4. aetherSlide / AI app 部署 ──────────────────────────────
 sec "4. aetherSlide / AI app 部署"
 kv "部署目錄" "$DEPLOY_DIR"
+# 版本:.env 的 TAG 是「設定要跑哪版」,實際跑的 image tag 是「現在真的在跑哪版」。
+# 兩者不一致 = 改了 TAG 但沒重建。hotfix / 客製版仍要人工補註記。
+kv "aetherSlide 版本 TAG(設定值)" "$(envval "$DEPLOY_DIR/.env" TAG)"
+if have docker; then
+  RUNNING_TAG="$(docker ps --format '{{.Image}}' 2>/dev/null | sed -n 's/.*:\([^:]*\)$/\1/p' | sort -u | paste -sd ', ' -)"
+  kv "實際執行中的 image tag" "${RUNNING_TAG:-(無執行中 container)}"
+fi
 kv "SITE_NAME(站台代號)" "$(envval "$DEPLOY_DIR/configs.env" SITE_NAME)"
 kv "MODULES(啟用的功能模組)" "$(envval "$DEPLOY_DIR/configs.env" MODULES)"
 kv "WEB_NETWORK_LOCATION(對外網址)" "$(envval "$DEPLOY_DIR/configs.env" WEB_NETWORK_LOCATION)"
@@ -246,8 +260,10 @@ if have systemctl; then
     | grep -iE 'docker|compose|aetherslide|website' | awk '{print $1}')"
   printf '### 相關 systemd service\n'
   if [ -n "$UNITS" ]; then printf '```\n%s\n```\n' "$UNITS"; else printf -- '- 無(可能是人工 `bin/dc up` 起的)\n'; fi
-  TIMERS="$(systemctl list-timers --no-pager --no-legend 2>/dev/null | head -10)"
-  printf '### systemd timer(排程)\n'
+  # 濾掉每台 Ubuntu 都有的 OS 預設 timer,只留這台自己加的
+  TIMERS="$(systemctl list-timers --all --no-pager --no-legend 2>/dev/null \
+    | grep -vE 'fwupd|man-db|logrotate|motd-news|dpkg-db-backup|systemd-tmpfiles|update-notifier|fstrim|sysstat|apt-daily|e2scrub|snapd|ua-timer|ubuntu-advantage|anacron|plocate|mlocate|apport')"
+  printf '### systemd timer(已濾掉 OS 預設,只留這台自己加的)\n'
   if [ -n "$TIMERS" ]; then printf '```\n%s\n```\n' "$TIMERS"; else printf -- '- 無\n'; fi
 fi
 
