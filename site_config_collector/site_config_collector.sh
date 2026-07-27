@@ -7,8 +7,16 @@
 #    用 -n 不會問密碼,沒權限就自動略過。)
 # 用法:
 #   在站台上執行:  bash collect_site_config.sh [部署目錄] [--peer [user@]host] [--no-remote] [--with-sudo]
+#                                              [--ai-landing-dir 目錄]
 #   部署目錄預設 ~/website(aetherSlide)。
 #   例:bash collect_site_config.sh ~/website > site_$(hostname).md
+#
+# AI Landing(AI 推論主機):自動偵測本機有沒有 AI Landing(部署目錄 + microk8s 的
+#   ai-landing namespace),有就多出一段完整採集。GPU 常跟 aetherSlide 分開裝,
+#   分開時請「兩台各跑一次」,輸出各貼進同一份 site config —— 本腳本不會自動 SSH 到
+#   AI Landing 主機(兩台常屬不同網段/不同單位,免密 SSH 通常不存在)。
+#   沒偵測到就只印 aetherSlide 的 AI_LANDING_URL 並判斷它指的是不是本機。
+#   --ai-landing-dir 手動指定(自動偵測不到時用)。
 #
 # dual node:自動判定本機是 node-1 還是 node-2(比對 .env 的 NODE_1_IP/NODE_2_IP),
 #   並嘗試 SSH 到另一台跑同一份腳本,一次收齊兩台。SSH 用 BatchMode(不會問密碼),
@@ -25,9 +33,14 @@ PEER=""
 DO_REMOTE=1
 CHILD=0   # 內部用:被另一個節點透過 SSH 叫起來的那一次
 WITH_SUDO=0
+AIL_DIR=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-sudo) WITH_SUDO=1; shift ;;
+    --ai-landing-dir)
+      AIL_DIR="${2:-}"
+      [ -n "$AIL_DIR" ] || { echo "--ai-landing-dir 需要目錄" >&2; exit 2; }
+      shift 2 ;;
     --peer)
       PEER="${2:-}"
       [ -n "$PEER" ] || { echo "--peer 需要 [user@]host" >&2; exit 2; }
@@ -35,7 +48,7 @@ while [ $# -gt 0 ]; do
     --no-remote) DO_REMOTE=0; shift ;;
     --remote-child) CHILD=1; DO_REMOTE=0; shift ;;
     -h|--help)
-      sed -n '2,13p' "${SELF:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'
+      sed -n '2,26p' "${SELF:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) DEPLOY_DIR="$1"; DEPLOY_DIR_EXPLICIT=1; shift ;;
   esac
@@ -51,6 +64,14 @@ envval() {
   [ -f "$1" ] || return 0
   grep -E "^[[:space:]]*$2=" "$1" 2>/dev/null | tail -1 |
     sed -E "s/^[[:space:]]*$2=//" | tr -d "\"'" | tr -d '\r'
+}
+# values.yaml 同樣逐鍵取值(不整檔倒出,密碼類鍵不會被查)。$2 是含縮排錨點的 grep 規則,
+# 因為同一個鍵名可能在不同層出現(例如 top-level 的 port 與 grafana service 的 port)。
+yamlval() {
+  [ -f "$1" ] || return 0
+  grep -E "$2" "$1" 2>/dev/null | head -1 |
+    sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^&[A-Za-z0-9_]+[[:space:]]*//' |
+    tr -d "\"'" | tr -d '\r'
 }
 
 # ── 0. 節點識別 ──────────────────────────────
@@ -71,8 +92,46 @@ if [ "$ARCH" = "dual" ]; then
   else NODE_SELF="dual/未知節點"; fi
 elif [ -n "$ARCH" ]; then
   NODE_SELF="$ARCH"
+elif [ -f "$DEPLOY_DIR/configs.env" ]; then
+  NODE_SELF="未知(configs.env 沒有 ARCHITECTURE)"
 else
-  NODE_SELF="未知(讀不到 $DEPLOY_DIR/configs.env)"
+  # v1.6:純 AI Landing 主機本來就沒有 configs.env,舊版會在標題印「讀不到 configs.env」,
+  # 看起來像 aetherSlide 壞了,其實是這台根本沒裝
+  NODE_SELF="非 aetherSlide 主機"
+fi
+
+# ── AI Landing(AI 推論主機)偵測 ──────────────
+# GPU 常跟 aetherSlide 分開裝,所以「本機有沒有 aetherSlide」與「本機有沒有 AI Landing」
+# 是兩個獨立的問題,要各自判,不能假設同一台。
+HAS_AS=0
+{ [ -f "$DEPLOY_DIR/configs.env" ] || [ -f "$DEPLOY_DIR/.env" ]; } && HAS_AS=1
+if [ -z "$AIL_DIR" ]; then
+  for _d in "$HOME/ai-landing" "$HOME/AI-Landing" /opt/ai-landing /opt/AI-Landing; do
+    [ -f "$_d/values.yaml" ] && { AIL_DIR="$_d"; break; }
+  done
+fi
+# k8s 指令:microk8s 優先(AI Landing 的官方裝法),退回原生 kubectl。
+# 判準用「真的問得到 namespace」而不是 command -v —— 指令在但沒權限或叢集沒起,
+# 後面每一條查詢都會空手而回,不如一開始就分清楚。
+KCTL=""
+if have microk8s && microk8s kubectl get ns >/dev/null 2>&1; then KCTL="microk8s kubectl"
+elif have kubectl && kubectl get ns >/dev/null 2>&1; then KCTL="kubectl"; fi
+kctl() { [ -n "$KCTL" ] && $KCTL "$@" 2>/dev/null; }
+HELM=""
+if have microk8s && microk8s helm version >/dev/null 2>&1; then HELM="microk8s helm"
+elif have helm; then HELM="helm"; fi
+
+AIL_NS="$(yamlval "$AIL_DIR/values.yaml" '^[[:space:]]+namespace:')"
+[ -n "$AIL_NS" ] || AIL_NS="ai-landing"
+HAS_AIL_NS=0
+[ -n "$KCTL" ] && $KCTL get ns "$AIL_NS" >/dev/null 2>&1 && HAS_AIL_NS=1
+HAS_AIL=0
+{ [ -n "$AIL_DIR" ] || [ "$HAS_AIL_NS" = "1" ]; } && HAS_AIL=1
+
+if [ "$HAS_AS" = "1" ] && [ "$HAS_AIL" = "1" ]; then ROLE="aetherSlide + AI Landing(同機)"
+elif [ "$HAS_AIL" = "1" ];                        then ROLE="AI Landing(本機沒有 aetherSlide)"
+elif [ "$HAS_AS" = "1" ];                         then ROLE="aetherSlide(本機沒有 AI Landing)"
+else                                                   ROLE="兩者都沒偵測到"
 fi
 
 printf '# site config 採集結果 — %s(%s)\n' "$(hostname 2>/dev/null || echo unknown)" "$NODE_SELF"
@@ -80,6 +139,7 @@ printf '> 唯讀採集。請把各段貼進 Obsidian 模板對應欄位;敏感�
 
 sec "0. 節點識別"
 kv "hostname" "$(hostname 2>/dev/null || echo unknown)"
+kv "本機角色" "$ROLE"
 kv "架構 ARCHITECTURE" "${ARCH:-未知}"
 kv "本機節點" "$NODE_SELF"
 if [ "$ARCH" = "dual" ]; then
@@ -191,9 +251,11 @@ kv "Kernel" "$(uname -r 2>/dev/null)"
 if have systemd-detect-virt; then kv "虛擬化" "$(systemd-detect-virt 2>/dev/null)"; fi
 if have docker; then kv "Docker" "$(docker --version 2>/dev/null)"; else note "無 docker"; fi
 printf '### 區塊裝置 / 分割\n```\n'
-if have lsblk; then lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>/dev/null; else note "無 lsblk"; fi
+# v1.6:-e 7 濾掉 loop 裝置(major 7)。microk8s 是 snap 裝的,AI Landing 主機上
+# 實測有 29 個 squashfs loop,把真正的磁碟結構整個淹掉 —— 跟 veth 洪水同一類問題。
+if have lsblk; then lsblk -e 7 -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>/dev/null; else note "無 lsblk"; fi
 printf '```\n### 磁碟使用 / mount\n```\n'
-if have df; then df -hT 2>/dev/null | grep -vE 'tmpfs|overlay'; fi
+if have df; then df -hT 2>/dev/null | grep -vE 'tmpfs|overlay|squashfs'; fi
 printf '```\n'
 if [ -f /proc/mdstat ] && grep -q '^md' /proc/mdstat 2>/dev/null; then
   printf '### RAID(mdstat)\n```\n'; cat /proc/mdstat 2>/dev/null; printf '```\n'
@@ -215,56 +277,59 @@ if have vgs; then
   fi
 fi
 
-# ── 4. aetherSlide / AI app 部署 ──────────────────────────────
+# ── 4. aetherSlide 部署 ──────────────────────────────
+# v1.6:整節用 HAS_AS 包起來。AI 推論主機常常沒有 aetherSlide(GPU 分開裝),
+# 舊版會照樣印出十幾個空欄位與「無執行中 container」,看起來像「裝了但全掛了」。
 sec "4. aetherSlide / AI app 部署"
-kv "部署目錄" "$DEPLOY_DIR"
-# 版本:.env 的 TAG 是「設定要跑哪版」,實際跑的 image tag 是「現在真的在跑哪版」。
-# 兩者不一致 = 改了 TAG 但沒重建。hotfix / 客製版仍要人工補註記。
-kv "aetherSlide 版本 TAG(設定值)" "$(envval "$DEPLOY_DIR/.env" TAG)"
-if have docker; then
-  # 只看自家 registry 的 image;redis 等第三方 image 的 tag 不是 aetherSlide 版本
-  RUNNING_TAG="$(docker ps --format '{{.Image}}' 2>/dev/null | grep -i aetherai |
-    sed -n 's/.*:\([^:]*\)$/\1/p' | sort -u | paste -sd ', ' -)"
-  if [ -z "$RUNNING_TAG" ] && docker ps -q 2>/dev/null | grep -q .; then
-    RUNNING_TAG="$(docker ps --format '{{.Image}}' 2>/dev/null | sed -n 's/.*:\([^:]*\)$/\1/p' | sort -u | paste -sd ', ' -)(非自家 registry,請確認)"
+if [ "$HAS_AS" = "0" ]; then
+  note "本機沒有 aetherSlide 部署($DEPLOY_DIR 找不到 configs.env / .env),本節略過"
+  note "部署在別的路徑的話用第一個參數指定:bash collect_site_config.sh /path/to/website"
+else
+  kv "部署目錄" "$DEPLOY_DIR"
+  # 版本:.env 的 TAG 是「設定要跑哪版」,實際跑的 image tag 是「現在真的在跑哪版」。
+  # 兩者不一致 = 改了 TAG 但沒重建。hotfix / 客製版仍要人工補註記。
+  kv "aetherSlide 版本 TAG(設定值)" "$(envval "$DEPLOY_DIR/.env" TAG)"
+  if have docker; then
+    # 只看自家 registry 的 image;redis 等第三方 image 的 tag 不是 aetherSlide 版本
+    RUNNING_TAG="$(docker ps --format '{{.Image}}' 2>/dev/null | grep -i aetherai |
+      sed -n 's/.*:\([^:]*\)$/\1/p' | sort -u | paste -sd ', ' -)"
+    if [ -z "$RUNNING_TAG" ] && docker ps -q 2>/dev/null | grep -q .; then
+      RUNNING_TAG="$(docker ps --format '{{.Image}}' 2>/dev/null | sed -n 's/.*:\([^:]*\)$/\1/p' | sort -u | paste -sd ', ' -)(非自家 registry,請確認)"
+    fi
+    kv "實際執行中的 image tag" "${RUNNING_TAG:-(無執行中 container)}"
   fi
-  kv "實際執行中的 image tag" "${RUNNING_TAG:-(無執行中 container)}"
-fi
-kv "SITE_NAME(站台代號)" "$(envval "$DEPLOY_DIR/configs.env" SITE_NAME)"
-kv "MODULES(啟用的功能模組)" "$(envval "$DEPLOY_DIR/configs.env" MODULES)"
-kv "WEB_NETWORK_LOCATION(對外網址)" "$(envval "$DEPLOY_DIR/configs.env" WEB_NETWORK_LOCATION)"
-if [ -d "$DEPLOY_DIR" ]; then
+  kv "SITE_NAME(站台代號)" "$(envval "$DEPLOY_DIR/configs.env" SITE_NAME)"
+  kv "MODULES(啟用的功能模組)" "$(envval "$DEPLOY_DIR/configs.env" MODULES)"
+  kv "WEB_NETWORK_LOCATION(對外網址)" "$(envval "$DEPLOY_DIR/configs.env" WEB_NETWORK_LOCATION)"
   printf '### 設定檔存在狀況\n'
   for f in configs.env prefs.env .env configs.yaml tier_configs.yaml model-config; do
     if [ -e "$DEPLOY_DIR/$f" ]; then kv "$f" "存在"; else kv "$f" "(無)"; fi
   done
   [ -d "$DEPLOY_DIR/secrets" ] && kv "secrets/" "存在(目錄)"
-else
-  note "部署目錄不存在:$DEPLOY_DIR"
-fi
-# 站台有幾十個容器,不健康的會混在清單裡看不到,所以先單獨拉出來當警示
-if have docker; then
-  BAD="$(docker ps --format '{{.Names}}\t{{.Status}}' 2>/dev/null |
-    grep -iE 'restarting|unhealthy|health: starting|created|paused')"
-  printf '### 狀態不正常的 container(先看這個)\n'
-  if [ -n "$BAD" ]; then
-    printf '```\n%s\n```\n' "$BAD"
-    printf -- '- _重啟中 / unhealthy 代表這個服務現在是壞的,交接時要問清楚原因_\n'
-  else
-    printf -- '- 無狀態異常的 container\n'
+  # 站台有幾十個容器,不健康的會混在清單裡看不到,所以先單獨拉出來當警示
+  if have docker; then
+    BAD="$(docker ps --format '{{.Names}}\t{{.Status}}' 2>/dev/null |
+      grep -iE 'restarting|unhealthy|health: starting|created|paused')"
+    printf '### 狀態不正常的 container(先看這個)\n'
+    if [ -n "$BAD" ]; then
+      printf '```\n%s\n```\n' "$BAD"
+      printf -- '- _重啟中 / unhealthy 代表這個服務現在是壞的,交接時要問清楚原因_\n'
+    else
+      printf -- '- 無狀態異常的 container\n'
+    fi
   fi
-fi
-printf '### 執行中 container(名稱 / image / 狀態 / 對外 port)\n```\n'
-if have docker; then
-  docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || note "docker ps 失敗(權限?)"
-else note "無 docker"; fi
-printf '```\n'
-# 只列最近 15 個。Exited (0) 多半是 init / volume 準備之類的一次性容器,屬正常
-if have docker; then
-  STOPPED="$(docker ps -a --filter 'status=exited' --filter 'status=dead' \
-    --format '{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null | head -15)"
-  printf '### 已停止的 container(Exited 0 多半是一次性初始化,非 0 才要追)\n'
-  if [ -n "$STOPPED" ]; then printf '```\n%s\n```\n' "$STOPPED"; else printf -- '- 無\n'; fi
+  printf '### 執行中 container(名稱 / image / 狀態 / 對外 port)\n```\n'
+  if have docker; then
+    docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || note "docker ps 失敗(權限?)"
+  else note "無 docker"; fi
+  printf '```\n'
+  # 只列最近 15 個。Exited (0) 多半是 init / volume 準備之類的一次性容器,屬正常
+  if have docker; then
+    STOPPED="$(docker ps -a --filter 'status=exited' --filter 'status=dead' \
+      --format '{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null | head -15)"
+    printf '### 已停止的 container(Exited 0 多半是一次性初始化,非 0 才要追)\n'
+    if [ -n "$STOPPED" ]; then printf '```\n%s\n```\n' "$STOPPED"; else printf -- '- 無\n'; fi
+  fi
 fi
 
 # ── 5. 對接與整合設定(從 configs.env 讀,不含任何密碼類鍵)─────────────
@@ -289,6 +354,10 @@ if [ -f "$DEPLOY_DIR/configs.env" ]; then
   kv "分層儲存 GIGASTORE_ENABLE_TIERING" "$(envval "$DEPLOY_DIR/configs.env" GIGASTORE_ENABLE_TIERING)(1=開)"
   kv "匯出路徑" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__EXPORT_PATH)"
   kv "NDPI 匯入時轉 DICOM" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__CONVERT_NDPI_TO_DICOM_ON_IMPORT)(1=開)"
+  # v1.6:AI 推論的去向。註解掉時走程式預設(http://dgx.aetherai.com),
+  # 所以「configs.env 沒這行」不等於「沒有 AI 推論」,要標出來而不是留空。
+  AIL_URL="$(envval "$DEPLOY_DIR/configs.env" AI_LANDING_URL)"
+  kv "AI_LANDING_URL(AI 推論端點)" "${AIL_URL:-(未設定 / 被註解 → 走程式預設值,需查該版預設)}"
   printf -- '_掃描機型號 / PACS-LIS-HIS 對接對象 / 對方 IP 與 port 仍需人工填(設定檔看不出來)_\n'
 else
   note "讀不到 $DEPLOY_DIR/configs.env"
@@ -306,7 +375,7 @@ crontab -l 2>/dev/null || printf '(無 crontab 或讀不到)\n'
 printf '```\n'
 if have systemctl; then
   UNITS="$(systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null \
-    | grep -iE 'docker|compose|aetherslide|website' | awk '{print $1}')"
+    | grep -iE 'docker|compose|aetherslide|website|microk8s|kubelet|containerd' | awk '{print $1}')"
   printf '### 相關 systemd service\n'
   if [ -n "$UNITS" ]; then printf '```\n%s\n```\n' "$UNITS"; else printf -- '- 無(可能是人工 `bin/dc up` 起的)\n'; fi
   # 濾掉每台 Ubuntu 都有的 OS 預設 timer,只留這台自己加的
@@ -316,13 +385,168 @@ if have systemctl; then
   if [ -n "$TIMERS" ]; then printf '```\n%s\n```\n' "$TIMERS"; else printf -- '- 無\n'; fi
 fi
 
-# ── 7. 另一個節點(dual;SSH 一次收齊兩台)──────────────────────────────
+# ── 7. AI Landing(AI 推論主機)──────────────────────────────
+# v1.6 新增。AI Landing 是 microk8s + helm,不是 docker compose,所以整段是另一套指令。
+# 跟 dual node 不同,這裡「不」自動 SSH 過去:dual 兩台是同一套部署、同一批人裝的,
+# 節點間免密 SSH 還有機會;aetherSlide 與 GPU 主機常屬不同網段甚至不同單位,
+# 自動連只會生一堆失敗訊息,不如明講「到那台再跑一次」。
+sec "7. AI Landing(AI 推論)"
+if [ "$HAS_AIL" = "0" ]; then
+  note "本機沒有 AI Landing(找不到部署目錄的 values.yaml,也沒有 $AIL_NS namespace)"
+  if [ -n "${AIL_URL:-}" ]; then
+    # 只比對 host 部分;URL 可能帶 port 或走 FQDN
+    AIL_HOST="$(printf '%s' "$AIL_URL" | sed -E 's#^[a-zA-Z]+://##; s#[:/].*$##')"
+    if has_ip "$AIL_HOST"; then
+      kv "AI_LANDING_URL 指向" "$AIL_URL(是本機 IP,但本機偵測不到 AI Landing → 需人工確認)"
+    else
+      kv "AI_LANDING_URL 指向" "$AIL_URL(**不是本機**,AI 推論在另一台)"
+      printf -- '- _請到那台主機再跑一次本腳本,把第 7 節貼進同一份 site config:_\n'
+      printf '```\nbash collect_site_config.sh --no-remote\n```\n'
+      printf -- '- _FQDN 的話實際 IP 由客戶 DNS/NAT 決定,要人工確認解析到哪台_\n'
+    fi
+  else
+    note "本機也沒有 aetherSlide 的 AI_LANDING_URL 可參考,無法定位推論主機"
+  fi
+else
+  kv "部署目錄" "${AIL_DIR:-(找不到;namespace 存在但目錄不在預設路徑,可用 --ai-landing-dir 指定)}"
+  kv "namespace" "$AIL_NS"
+  if [ -z "$KCTL" ]; then
+    note "有部署目錄但 kubectl / microk8s kubectl 問不到叢集(權限?叢集沒起?),以下只列設定檔內容"
+  else
+    kv "k8s 指令" "$KCTL"
+    have microk8s && kv "MicroK8s 版本" "$(microk8s version 2>/dev/null | head -1)"
+  fi
+
+  # ── 版本:三個來源要並列 ──
+  # 實測 gpu-a4000:helm 顯示 0.0.0-<sha>、Chart.yaml 寫 1.1.18、image tag 是 git sha。
+  # CI build 的部署 appVersion 會變成 0.0.0-<sha>,只抓一個會誤導。
+  printf '### 版本(三個來源,不一致是常態,要一起看)\n'
+  kv "Chart.yaml appVersion(部署目錄)" "$(yamlval "$AIL_DIR/charts/ai-landing/Chart.yaml" '^appVersion:')"
+  if [ -n "$HELM" ]; then
+    HELM_OUT="$($HELM list -A 2>/dev/null)"
+    if [ -n "$HELM_OUT" ]; then
+      printf '```\n%s\n```\n' "$HELM_OUT"
+    else
+      note "helm list 查不到 release(權限?)"
+    fi
+  else
+    note "無 helm"
+  fi
+  IMGS="$(kctl get deploy -n "$AIL_NS" -o 'custom-columns=NAME:.metadata.name,IMAGE:.spec.template.spec.containers[*].image' --no-headers)"
+  if [ -n "$IMGS" ]; then
+    printf '### 核心服務 image(實際在跑的版本)\n```\n%s\n```\n' "$IMGS"
+  fi
+
+  # ── values.yaml:逐鍵取值,密碼類鍵一律不查(同 configs.env 的原則)──
+  if [ -f "$AIL_DIR/values.yaml" ]; then
+    printf '### values.yaml(非密鍵;adminPassword / SECRET_KEY / *_PASS 刻意不抓)\n'
+    kv "external_ip" "$(yamlval "$AIL_DIR/values.yaml" '^external_ip:')"
+    kv "port" "$(yamlval "$AIL_DIR/values.yaml" '^port:')"
+    kv "image registry" "$(yamlval "$AIL_DIR/values.yaml" '^[[:space:]]+host:')/$(yamlval "$AIL_DIR/values.yaml" '^[[:space:]]+repository:')"
+    kv "backend image_tag" "$(yamlval "$AIL_DIR/values.yaml" '^[[:space:]]+image_tag:')"
+    kv "DJANGO_ALLOWED_HOSTS" "$(yamlval "$AIL_DIR/values.yaml" 'DJANGO_ALLOWED_HOSTS:')"
+    kv "DJANGO_DEBUG" "$(yamlval "$AIL_DIR/values.yaml" 'DJANGO_DEBUG:')"
+    kv "BACKEND_URL_PREFIX" "$(yamlval "$AIL_DIR/values.yaml" 'BACKEND_URL_PREFIX:')"
+    kv "BACKEND_JOB_TTL_DAYS_AFTER_FINISHED" "$(yamlval "$AIL_DIR/values.yaml" 'BACKEND_JOB_TTL_DAYS_AFTER_FINISHED:')(job 保留天數,決定下面的統計看得到多久)"
+    kv "UWSGI_PROCESS_NUMBER" "$(yamlval "$AIL_DIR/values.yaml" 'UWSGI_PROCESS_NUMBER:')"
+    kv "backend logs storage_class" "$(yamlval "$AIL_DIR/values.yaml" '^[[:space:]]+storage_class:')"
+    kv "database volumeSize" "$(yamlval "$AIL_DIR/values.yaml" '^[[:space:]]+volumeSize:')"
+  else
+    note "找不到 $AIL_DIR/values.yaml"
+  fi
+
+  # ── 對外端點 ──
+  # 實測:8500 是 svc/ingress 的 externalIPs,由 kube-proxy 的 iptables 轉,
+  # 主機上「沒有」listening socket,ss -ltnp 抓不到 —— 只能問 k8s。
+  if [ -n "$KCTL" ]; then
+    printf '### 對外端點(externalIPs 沒有 listening socket,ss 抓不到,只能問 k8s)\n'
+    ING_SVC="$(kctl get svc -A --no-headers -o 'custom-columns=NS:.metadata.namespace,NAME:.metadata.name,TYPE:.spec.type,EXTIP:.spec.externalIPs[*],PORT:.spec.ports[*].port' | awk '$4!="<none>"')"
+    if [ -n "$ING_SVC" ]; then printf '```\n%s\n```\n' "$ING_SVC"; else note "沒有帶 externalIPs 的 service"; fi
+    NP_SVC="$(kctl get svc -A --no-headers -o 'custom-columns=NS:.metadata.namespace,NAME:.metadata.name,TYPE:.spec.type,NODEPORT:.spec.ports[*].nodePort' | awk '$3=="NodePort"')"
+    printf '#### NodePort service\n'
+    if [ -n "$NP_SVC" ]; then printf '```\n%s\n```\n' "$NP_SVC"; else printf -- '- 無\n'; fi
+    ING="$(kctl get ingress -A --no-headers)"
+    printf '#### Ingress\n'
+    if [ -n "$ING" ]; then printf '```\n%s\n```\n' "$ING"; else printf -- '- 無\n'; fi
+  fi
+
+  # ── 叢集節點與 GPU 配置 ──
+  if [ -n "$KCTL" ]; then
+    printf '### 叢集節點\n```\n'
+    kctl get nodes --no-headers -o 'custom-columns=NAME:.metadata.name,ROLES:.metadata.labels.node-role,VER:.status.nodeInfo.kubeletVersion,IP:.status.addresses[0].address,GPU:.status.capacity.nvidia\.com/gpu,RUNTIME:.status.nodeInfo.containerRuntimeVersion'
+    printf '```\n'
+    NODE_N="$(kctl get nodes --no-headers | wc -l | tr -d ' ')"
+    kv "節點數" "${NODE_N:-未知}(1 = 單節點,>1 表示有加 worker)"
+    # 實體 GPU 數 vs k8s 看到的 GPU 數:不一致就是 time-slicing 在切
+    PHYS_GPU="$(nvidia-smi -L 2>/dev/null | grep -c GPU)"
+    K8S_GPU="$(kctl get nodes -o 'custom-columns=G:.status.capacity.nvidia\.com/gpu' --no-headers | awk '$1 ~ /^[0-9]+$/ {s+=$1} END{print s+0}')"
+    kv "實體 GPU 數(nvidia-smi)" "${PHYS_GPU:-0}"
+    kv "k8s 可配置 GPU 數(capacity)" "${K8S_GPU:-0}(大於實體數 = time-slicing 有開)"
+    TS="$(kctl get cm -A --no-headers | grep -i time-slicing)"
+    printf '#### time-slicing configmap\n'
+    if [ -n "$TS" ]; then printf '```\n%s\n```\n' "$TS"; else printf -- '- 無(未設定 time-slicing)\n'; fi
+  fi
+
+  # ── pod 狀態 ──
+  # 實測 gpu-a4000:這個 namespace 有 1369 個 pod,其中 1359 個是推論 job 留下的。
+  # 無腦 `get pods` 會吐 1369 行把報告淹掉,所以依 ownerReferences 拆兩半:
+  # Job 擁有的只給統計,其餘(Deployment/StatefulSet/DaemonSet)才逐一列。
+  if [ -n "$KCTL" ]; then
+    PODS="$(kctl get pods -n "$AIL_NS" --no-headers -o 'custom-columns=OWNER:.metadata.ownerReferences[*].kind,NAME:.metadata.name,PHASE:.status.phase,REASON:.status.reason,READY:.status.containerStatuses[*].ready,RESTARTS:.status.containerStatuses[*].restartCount')"
+    CORE="$(printf '%s\n' "$PODS" | awk '$1!="Job"')"
+    printf '### 核心 pod(已排除推論 job 的 pod)\n'
+    if [ -n "$CORE" ]; then printf '```\n%s\n```\n' "$CORE"; else note "查不到 pod"; fi
+    BADP="$(printf '%s\n' "$CORE" | awk '$3!="Running" && $3!="Succeeded" || $5 ~ /false/')"
+    printf '#### 狀態不正常的核心 pod(先看這個)\n'
+    if [ -n "$BADP" ]; then
+      printf '```\n%s\n```\n' "$BADP"
+      printf -- '- _交接時要問清楚原因_\n'
+    else
+      printf -- '- 無\n'
+    fi
+    printf '#### 推論 job 統計(受 BACKEND_JOB_TTL_DAYS_AFTER_FINISHED 限制,只看得到保留期內的)\n'
+    JOB_N="$(kctl get jobs -n "$AIL_NS" --no-headers | wc -l | tr -d ' ')"
+    kv "job 總數" "${JOB_N:-0}"
+    printf '```\n%s\n```\n' "$(printf '%s\n' "$PODS" | awk '$1=="Job"{print $3" "$4}' | sort | uniq -c | sort -rn)"
+    # 這是模板「AI model 版本」那格唯一抓得到的來源:跑過哪些 AI app 與版本。
+    # 實測會混進 prometheus / grafana / postgres 等基礎設施 image,所以先只留 /ai-app/;
+    # 客製 registry 路徑可能不長這樣,一個都沒命中就退回列全部並註明(同 v1.3 image tag 的做法)。
+    ALL_IMG="$(kctl get pods -n "$AIL_NS" --no-headers -o 'custom-columns=IMG:.spec.containers[*].image' |
+      tr ',' '\n' | sed 's/^ *//' | grep -v '^$')"
+    APP_IMG="$(printf '%s\n' "$ALL_IMG" | grep '/ai-app/' | sort | uniq -c | sort -rn)"
+    printf '#### 保留期內跑過的 AI app image(次數 / image)\n'
+    if [ -n "$APP_IMG" ]; then
+      printf '```\n%s\n```\n' "$APP_IMG"
+    else
+      printf -- '- _沒有 `/ai-app/` 路徑的 image,改列全部(含基礎設施 image,需自行分辨)_\n'
+      printf '```\n%s\n```\n' "$(printf '%s\n' "$ALL_IMG" | sort | uniq -c | sort -rn)"
+    fi
+    printf -- '_這是「跑過」不是「裝了哪些」;沒被呼叫過的 app 不會出現_\n'
+    printf '### PVC\n```\n'
+    kctl get pvc -n "$AIL_NS" --no-headers
+    printf '```\n'
+  fi
+
+  # ── aetherSlide 憑證註冊(兩邊的信任鏈)──
+  CA=""
+  for _c in "$AIL_DIR/ca-cert.internal.pem" "$AIL_DIR/bin/ca-cert.internal.pem"; do
+    [ -f "$_c" ] && { CA="$_c"; break; }
+  done
+  if [ -n "$CA" ]; then
+    kv "aetherSlide CA 憑證檔" "$CA(內含 $(grep -c 'BEGIN CERTIFICATE' "$CA" 2>/dev/null) 張;多站共用同一套推論時會串接多張)"
+  else
+    note "找不到 ca-cert.internal.pem(k8s_init.sh 註冊用);已註冊的憑證在叢集內,檔案不在不代表沒註冊"
+  fi
+  printf -- '_哪些 aetherSlide 站台連這台、GPU 由誰採購保固、模型更新誰做,設定看不出來,要人工填_\n'
+fi
+
+# ── 8. 另一個節點(dual;SSH 一次收齊兩台)──────────────────────────────
 # 遠端跑的是同一份腳本(從 stdin 餵過去,不落地),並帶 --no-remote 避免互相遞迴。
 PEER_TARGET="$PEER"
 [ -n "$PEER_TARGET" ] || { [ "$ARCH" = "dual" ] && PEER_TARGET="$PEER_IP"; }
 
 if [ "$DO_REMOTE" = "1" ] && [ -n "$PEER_TARGET" ]; then
-  sec "7. 另一個節點(遠端採集:$PEER_TARGET)"
+  sec "8. 另一個節點(遠端採集:$PEER_TARGET)"
   REMOTE_ARGS="--remote-child"
   [ "$DEPLOY_DIR_EXPLICIT" = "1" ] && REMOTE_ARGS="$REMOTE_ARGS '$DEPLOY_DIR'"
   if [ -z "$SELF" ] || [ ! -r "$SELF" ]; then
@@ -341,7 +565,7 @@ if [ "$DO_REMOTE" = "1" ] && [ -n "$PEER_TARGET" ]; then
   fi
   rm -f /tmp/.sc_ssh_err 2>/dev/null
 elif [ "$ARCH" = "dual" ] && [ "$CHILD" = "0" ]; then
-  sec "7. 另一個節點"
+  sec "8. 另一個節點"
   if [ "$DO_REMOTE" = "0" ]; then
     note "--no-remote:只採本機,另一台請自行執行"
   else
