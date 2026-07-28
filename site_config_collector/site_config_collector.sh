@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
-# collect_site_config.sh v1.10 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 Obsidian
+# collect_site_config.sh v1.11 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 Obsidian
 # site config 站頁(標「腳本」的欄位)。
+#
+# v1.11 相對 v1.10(與 v1.10 同一個教訓的第二個實例:值本身要會說話,不能只靠引言警語):
+#   **虛擬網卡的 speed 加 `*` 標記**。v1.10 的介面明細表在 ukt 兩台 vmware VM 上照印
+#   10000Mb/s,只有表格上方一句引言說那是 guest 視角 —— 跳過引言直接看表的人會誤讀成
+#   「這台有 10G」。現在 vmxnet3 / virtio_net / e1000 / hv_netvsc / xen-netfront 這些
+#   驅動的 speed 一律標星號,並在表下說明真正的上限在 hypervisor(實體 uplink、vSwitch
+#   teaming、port group 的 traffic shaping —— 這三件 guest 都看不到,只能問客戶)。
+#   判斷用驅動名而不是 VIRT:實體機不會出現這些驅動,也就不必把 VIRT 的計算提早。
+#   另外偵測到 e1000/e1000e(**模擬**卡,非半虛擬化)會多印一行提醒 —— VM 上「型號」那格
+#   唯一的實用價值就是分辨這個。
 #
 # v1.10 相對 v1.9(ukt 實跑後的修正,只動 CPU steal 一處):
 #   **VMware / Hyper-V 的 guest 量不到 CPU steal**。v1.9 在 ukt 兩台 vmware VM 上印 0.00%,
@@ -88,7 +98,7 @@ while [ $# -gt 0 ]; do
     --no-remote) DO_REMOTE=0; shift ;;
     --remote-child) CHILD=1; DO_REMOTE=0; shift ;;
     -h|--help)
-      sed -n '2,66p' "${SELF:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'
+      sed -n '2,76p' "${SELF:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) DEPLOY_DIR="$1"; DEPLOY_DIR_EXPLICIT=1; shift ;;
   esac
@@ -258,6 +268,8 @@ printf '### 介面明細(speed / MTU / 驅動 / 型號)\n'
 printf -- '> `br0` / `bond0` 這類虛擬介面的 speed 是聚合出來的虛擬值(實測 demo 機 `br0` 報 10000Mb/s,\n'
 printf -- '> 底下的實體卡其實只跑 1000Mb/s)。**要看實體那一列,不要看 bridge 那一列。**\n'
 printf '```\n'
+VIRTNIC_SEEN=0
+EMULATED_NIC_SEEN=0
 # 標題用英文:中文字在等寬字型佔兩格,printf 的 %-Ns 按字元數算會錯位
 printf '%-14s %-6s %-10s %-6s %-12s %s\n' iface state speed MTU driver model
 for _n in $IFLIST; do
@@ -268,6 +280,15 @@ for _n in $IFLIST; do
   case "$_sp" in ''|-1|*[!0-9-]*) _sp='-' ;; *) _sp="${_sp}Mb/s" ;; esac
   _drv="$(basename "$(readlink -f "/sys/class/net/$_n/device/driver" 2>/dev/null)" 2>/dev/null)"
   [ -n "$_drv" ] && [ "$_drv" != "." ] || _drv='-'
+  # v1.11:虛擬網卡的 speed 是 hypervisor 給的固定值,與實體上限無關 —— 加 * 標記。
+  # 用驅動名判斷就夠,不必先算 VIRT:實體機不會出現 vmxnet3 / virtio_net 這些驅動。
+  # 星號而不是「(虛擬值)」是為了不破壞欄位對齊(中文在等寬字型佔兩格,printf 按字元數算)。
+  case "$_drv" in
+    vmxnet3|virtio_net|e1000|e1000e|hv_netvsc|xen-netfront)
+      VIRTNIC_SEEN=1
+      [ "$_sp" = '-' ] || _sp="${_sp}*"
+      case "$_drv" in e1000|e1000e) EMULATED_NIC_SEEN=1 ;; esac ;;
+  esac
   _model='-'
   if have lspci; then
     _pci="$(basename "$(readlink -f "/sys/class/net/$_n/device" 2>/dev/null)" 2>/dev/null)"
@@ -280,6 +301,18 @@ for _n in $IFLIST; do
   printf '%-14s %-6s %-10s %-6s %-12s %s\n' "$_n" "$_state" "$_sp" "$_mtu" "$_drv" "$_model"
 done
 printf '```\n'
+# v1.11:星號的說明只在真的有虛擬網卡時才印,實體機不用看這段。
+if [ "$VIRTNIC_SEEN" = "1" ]; then
+  printf -- '> `*` = **虛擬網卡驅動回報的值,不是實體上限**。vmxnet3 / virtio 幾乎一律報 10000Mb/s,\n'
+  printf -- '> 與底下實體網卡是 1G 還是 25G 無關。真正的上限在 hypervisor:實體 uplink、vSwitch 的\n'
+  printf -- '> teaming(**guest 看不到 host 這層的鏈路聚合**)、以及 port group 有沒有設 traffic shaping\n'
+  printf -- '> (可以直接限速,guest 完全無感)。**這三件事只能向客戶的虛擬化管理者要。**\n'
+  printf -- '> VM 上這張表真正有效的是 **MTU** 與下面的**累積錯誤**,speed 與型號只能拿來看「用的是哪種虛擬網卡」。\n'
+fi
+if [ "$EMULATED_NIC_SEEN" = "1" ]; then
+  printf -- '> ⚠ 偵測到 **e1000 / e1000e** —— 那是**模擬**的 Intel 千兆卡,不是半虛擬化網卡\n'
+  printf -- '> (vmxnet3 / virtio_net)。吞吐與 CPU 開銷都明顯較差,通常是建 VM 時範本沒改或沒裝 VMware Tools。\n'
+fi
 # MTU 1500 vs 9000(jumbo frame)對 NFS 大檔讀取差很多,所以上面那張表要連 MTU 一起看。
 # DOWN 的實體網卡不濾掉:「有第二張 10G/25G 埠沒接線」是擴充頻寬最便宜的一條路
 # (ukt 的 GPU node 就有 6 張 DOWN 的實體網卡)。
