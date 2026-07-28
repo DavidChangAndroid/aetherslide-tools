@@ -1,6 +1,35 @@
 #!/usr/bin/env bash
-# collect_site_config.sh — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 Obsidian
-# site config 模板(標「腳本」的欄位)。
+# collect_site_config.sh v1.9 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 Obsidian
+# site config 站頁(標「腳本」的欄位)。
+#
+# v1.9 相對 v1.8:補網路與儲存的「容量與健康」欄位,用途是評估**未來把 AI agent
+#   接進 aetherSlide** 時,現有環境撐不撐得住(agent 若要讀影像,每片是 GB 級,
+#   而 dual 站的資料全在 NFS 上 —— 同一張網卡收一次、送一次,是雙重計費)。
+#   ① 第 1 段:介面明細(link speed / MTU / 驅動與型號 / 累積錯誤與丟包),
+#      DOWN 的實體網卡也照列 —— 「有 10G 埠沒接線」是擴充頻寬最便宜的一條路。
+#   ② 第 1 段:bonding / VLAN。
+#   ③ 第 4 段:虛擬機的 CPU steal(自開機累積佔比,判斷 host 有沒有超賣)。
+#   ④ 第 4 段:NFS 掛載的關鍵參數(vers / proto / rsize / wsize / hard-soft / timeo)。
+#   ⑤ 第 4 段:NFS export(/etc/exports)—— 補齊 v1.8「這台把資料分享出去」只做了 samba
+#      的另一半。實測 demo 機有 /proc/fs/nfsd 才發現這個缺口。
+#   **刻意不採時點值**:即時流量水位、NFS RTT 這類上下班差很多的數字不進來
+#   (要看那些請當場跑 sar / nfsiostat)。這裡只放「開機以來就固定,或累積型」的欄位。
+#   ⚠ VM 的 link speed 是 guest 視角:vmxnet3 不管底下實體是什麼常常都報 10000Mb/s,
+#     真正的上限在 ESXi host 的 uplink 與同 host 其他 VM 的競爭,腳本問不到,要問客戶。
+#
+# v1.8 相對 v1.7:補「這台把資料分享出去」這一類 —— 站台自建、不屬於 aetherSlide、
+#   但正在服務 aetherSlide 資料的服務。起因是 ukt node-1 有客戶客製的 samba 分享
+#   /data/export 給 Windows 取檔,v1.7 兩處都漏掉它:
+#   ① 第 6 段 systemd 白名單只含 docker/compose/aetherslide/website/microk8s 等,
+#      smbd 被濾掉 → 白名單加 smb/nmb/winbind/nfs-server。
+#   ② v1.2 起不再列 listen port(當時嫌 NFS/RPC 動態高位 port 雜訊多),445 跟著消失
+#      → 不恢復 port 掃描,改在第 4 段直接讀 /etc/samba/smb.conf 列出分享名與 path。
+#
+# v1.7 相對 v1.6 只改輸出的「順序與段名」,採集邏輯完全沒動:
+#   段落順序改成與站頁一致(M-machine 各節 → GPU node → M-config 的對接),
+#   段名改成站頁的小節名,貼的時候一段對一節,不用再自己找位置。
+#   「對接與整合設定」從第 5 段移到第 8 段 —— 它讀的是 configs.env,屬 M-config 層,
+#   不是機器現況,夾在機器段中間會讓人把它貼錯區塊。
 #
 # 安全性:全程唯讀,不安裝、不修改、不需 sudo。可直接在正式機執行。
 #   (--with-sudo 例外:多跑一個 `sudo -n dmidecode` 抓硬體序號,仍是唯讀查詢;
@@ -13,7 +42,9 @@
 #
 # AI Landing(AI 推論主機):自動偵測本機有沒有 AI Landing(部署目錄 + microk8s 的
 #   ai-landing namespace),有就多出一段完整採集。GPU 常跟 aetherSlide 分開裝,
-#   分開時請「兩台各跑一次」,輸出各貼進同一份 site config —— 本腳本不會自動 SSH 到
+#   分開時請「兩台各跑一次」;GPU 那台的輸出貼進站頁 M-machine 的「GPU node」段
+#   (那台的 1–7 段都要,不是只有第 7 段:OS / 磁碟 / NFS / container 都在前面幾段)。
+#   本腳本不會自動 SSH 到
 #   AI Landing 主機(兩台常屬不同網段/不同單位,免密 SSH 通常不存在)。
 #   沒偵測到就只印 aetherSlide 的 AI_LANDING_URL 並判斷它指的是不是本機。
 #   --ai-landing-dir 手動指定(自動偵測不到時用)。
@@ -48,7 +79,7 @@ while [ $# -gt 0 ]; do
     --no-remote) DO_REMOTE=0; shift ;;
     --remote-child) CHILD=1; DO_REMOTE=0; shift ;;
     -h|--help)
-      sed -n '2,26p' "${SELF:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'
+      sed -n '2,55p' "${SELF:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) DEPLOY_DIR="$1"; DEPLOY_DIR_EXPLICIT=1; shift ;;
   esac
@@ -121,6 +152,9 @@ HELM=""
 if have microk8s && microk8s helm version >/dev/null 2>&1; then HELM="microk8s helm"
 elif have helm; then HELM="helm"; fi
 
+# v1.7:AI_LANDING_URL 提早在這裡算。原本寫在「對接與整合設定」那段裡,
+# 那段移到 AI Landing 之後,不提早算的話 AI Landing 段會讀不到、定位不了推論主機。
+AIL_URL="$(envval "$DEPLOY_DIR/configs.env" AI_LANDING_URL)"
 AIL_NS="$(yamlval "$AIL_DIR/values.yaml" '^[[:space:]]+namespace:')"
 [ -n "$AIL_NS" ] || AIL_NS="ai-landing"
 HAS_AIL_NS=0
@@ -135,7 +169,17 @@ else                                                   ROLE="兩者都沒偵測�
 fi
 
 printf '# site config 採集結果 — %s(%s)\n' "$(hostname 2>/dev/null || echo unknown)" "$NODE_SELF"
-printf '> 唯讀採集。請把各段貼進 Obsidian 模板對應欄位;敏感值(帳密/私鑰)本腳本刻意不抓。\n'
+printf '> 唯讀採集。敏感值(帳密/私鑰)本腳本刻意不抓。\n'
+printf '>\n'
+printf '> **貼到哪**(段落順序已與站頁一致,由上而下對著貼):\n'
+printf '>\n'
+printf '> | 本檔區段 | 站頁區塊 |\n'
+printf '> |---|---|\n'
+printf '> | 0 節點識別 | 不直接貼,用來確認架構與本機是哪一台 |\n'
+printf '> | 1–6 | `AUTO:M-machine` 的同名小節 |\n'
+printf '> | 7 GPU node / AI Landing | `AUTO:M-machine` 末段「GPU node」 |\n'
+printf '> | 8 對接與整合設定 | `AUTO:M-config` 的「對接(整合)」 |\n'
+printf '> | 9 另一個節點 | 併進 M-machine 各表的 Node 2 欄 |\n'
 
 sec "0. 節點識別"
 kv "hostname" "$(hostname 2>/dev/null || echo unknown)"
@@ -156,8 +200,8 @@ if [ "$ARCH" = "dual" ]; then
     printf -- '- _NODE_1_IP/NODE_2_IP 都不在本機介面上,可能是 .env 未填或走 NAT;請人工確認_\n'
 fi
 
-# ── 1. 對外與網路 ──────────────────────────────
-sec "1. 對外與網路"
+# ── 1. 節點與網路 ──────────────────────────────
+sec "1. 節點與網路"
 # 自動判斷最可能的對外路徑:預設路由的介面就是主要對外網卡,不列整張路由表
 if have ip; then
   DEF_LINE="$(ip route show default 2>/dev/null | head -1)"
@@ -176,29 +220,98 @@ fi
 #                  兩者皆非,不必知道名字就會被擋掉;DOWN 但存在的實體網卡會留著
 #                  (「有第二張網卡沒接線」是交接時要知道的事)。
 #   第二層(反向):再擋掉「有 IP 但屬於容器 / 虛擬化橋接」的那一小類。
+# v1.9:同一份過濾結果先存起來,下面「介面明細」重用,不重跑一次過濾。
+IFLIST=""
+for _if in /sys/class/net/*; do
+  _n="$(basename "$_if")"
+  [ "$_n" = "lo" ] && continue
+  case "$_n" in
+    docker*|cni*|flannel*|kube-ipvs*|virbr*|mpqemubr*|lxdbr*|lxcbr*|podman*) continue ;;
+  esac
+  printf '%s' "$_n" | grep -qE '^br-[0-9a-f]{6,}$' && continue   # docker 自建 bridge
+  if [ -e "$_if/device" ] ||
+     { have ip && ip -4 -brief addr show "$_n" 2>/dev/null | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; }; then
+    IFLIST="$IFLIST $_n"
+  fi
+done
 printf '### 網路介面(已濾掉容器與虛擬網卡)\n```\n'
 if have ip; then
-  for _if in /sys/class/net/*; do
-    _n="$(basename "$_if")"
-    [ "$_n" = "lo" ] && continue
-    case "$_n" in
-      docker*|cni*|flannel*|kube-ipvs*|virbr*|mpqemubr*|lxdbr*|lxcbr*|podman*) continue ;;
-    esac
-    printf '%s' "$_n" | grep -qE '^br-[0-9a-f]{6,}$' && continue   # docker 自建 bridge
-    if [ -e "$_if/device" ] ||
-       ip -4 -brief addr show "$_n" 2>/dev/null | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
-      ip -brief addr show "$_n" 2>/dev/null
-    fi
-  done
+  for _n in $IFLIST; do ip -brief addr show "$_n" 2>/dev/null; done
 fi
-printf '```\n### DNS\n```\n'
+printf '```\n'
+# v1.9:介面明細。撈的是「開機以來就固定 or 累積型」的欄位,不撈即時流量
+# (那種上下班差很多,採集當下的值沒有代表性)。用途:評估未來 AI agent 接進來時
+# 頻寬夠不夠 —— dual 站資料全在 NFS,影像進到 image-server 走一次網路、
+# 送給瀏覽器再走一次,同一張卡雙重計費。
+# speed / MTU 都讀 sysfs 不用 ethtool:ethtool 讀 speed 要 CAP_NET_ADMIN,sysfs 不用。
+# 型號用 lspci 補,只有驅動名(vmxnet3 / i40e)看不出是 1G 還是 25G 卡。
+printf '### 介面明細(speed / MTU / 驅動 / 型號)\n'
+printf -- '> `br0` / `bond0` 這類虛擬介面的 speed 是聚合出來的虛擬值(實測 demo 機 `br0` 報 10000Mb/s,\n'
+printf -- '> 底下的實體卡其實只跑 1000Mb/s)。**要看實體那一列,不要看 bridge 那一列。**\n'
+printf '```\n'
+# 標題用英文:中文字在等寬字型佔兩格,printf 的 %-Ns 按字元數算會錯位
+printf '%-14s %-6s %-10s %-6s %-12s %s\n' iface state speed MTU driver model
+for _n in $IFLIST; do
+  _state="$(cat "/sys/class/net/$_n/operstate" 2>/dev/null || echo '?')"
+  _mtu="$(cat "/sys/class/net/$_n/mtu" 2>/dev/null || echo '-')"
+  # DOWN 或虛擬介面讀 speed 會失敗或回 -1,這不是錯誤,照實標「-」
+  _sp="$(cat "/sys/class/net/$_n/speed" 2>/dev/null)"
+  case "$_sp" in ''|-1|*[!0-9-]*) _sp='-' ;; *) _sp="${_sp}Mb/s" ;; esac
+  _drv="$(basename "$(readlink -f "/sys/class/net/$_n/device/driver" 2>/dev/null)" 2>/dev/null)"
+  [ -n "$_drv" ] && [ "$_drv" != "." ] || _drv='-'
+  _model='-'
+  if have lspci; then
+    _pci="$(basename "$(readlink -f "/sys/class/net/$_n/device" 2>/dev/null)" 2>/dev/null)"
+    case "$_pci" in
+      # lspci 的類別前綴("Ethernet controller: " / "Network controller: ")砍掉,只留廠牌型號
+      *:*:*.*) _model="$(lspci -s "$_pci" 2>/dev/null | sed 's/^[^ ]* //; s/^[A-Za-z ]*controller: //' | head -1)" ;;
+    esac
+    [ -n "$_model" ] || _model='-'
+  fi
+  printf '%-14s %-6s %-10s %-6s %-12s %s\n' "$_n" "$_state" "$_sp" "$_mtu" "$_drv" "$_model"
+done
+printf '```\n'
+# MTU 1500 vs 9000(jumbo frame)對 NFS 大檔讀取差很多,所以上面那張表要連 MTU 一起看。
+# DOWN 的實體網卡不濾掉:「有第二張 10G/25G 埠沒接線」是擴充頻寬最便宜的一條路
+# (ukt 的 GPU node 就有 6 張 DOWN 的實體網卡)。
+printf '### 介面累積錯誤 / 丟包(自開機累積,非時點值)\n'
+printf -- '> **`rx_drop` 在 bridge 與實體卡上常態就有數字**(收到不是給本機的封包也算),\n'
+printf -- '> 實測 demo 機 `br0` 有 300 萬筆。**要看的是 `rx_err`/`tx_err`,那才代表線路或卡有問題。**\n'
+IFERR=""
+for _n in $IFLIST; do
+  _s="/sys/class/net/$_n/statistics"
+  _re="$(cat "$_s/rx_errors" 2>/dev/null || echo 0)"; _te="$(cat "$_s/tx_errors" 2>/dev/null || echo 0)"
+  _rd="$(cat "$_s/rx_dropped" 2>/dev/null || echo 0)"; _td="$(cat "$_s/tx_dropped" 2>/dev/null || echo 0)"
+  if [ "$_re$_te$_rd$_td" != "0000" ]; then
+    IFERR="$IFERR$(printf '%-14s rx_err=%-8s tx_err=%-8s rx_drop=%-10s tx_drop=%s' "$_n" "$_re" "$_te" "$_rd" "$_td")
+"
+  fi
+done
+if [ -n "$IFERR" ]; then printf '```\n%s```\n' "$IFERR"; else printf -- '- 全部介面的 rx/tx errors 與 dropped 都是 0\n'; fi
+# bonding / VLAN:有沒有做鏈路聚合直接決定頻寬上限是一張卡還是兩張卡
+if [ -d /proc/net/bonding ] && ls /proc/net/bonding/* >/dev/null 2>&1; then
+  printf '### bonding\n```\n'
+  for _b in /proc/net/bonding/*; do
+    printf '[%s]\n' "$(basename "$_b")"
+    grep -E 'Bonding Mode|Slave Interface|MII Status|Speed|Aggregator ID' "$_b" 2>/dev/null
+  done
+  printf '```\n'
+else
+  printf -- '- **bonding**: 無(沒有 `/proc/net/bonding`,單卡)\n'
+fi
+if [ -s /proc/net/vlan/config ]; then
+  printf '### VLAN\n```\n'; cat /proc/net/vlan/config 2>/dev/null; printf '```\n'
+else
+  printf -- '- **VLAN**: 無(guest 看不到 VLAN 標籤時這裡也會是「無」,交換器側要另外問)\n'
+fi
+printf '### DNS\n```\n'
 grep -E '^nameserver' /etc/resolv.conf 2>/dev/null || note "讀不到 resolv.conf"
 printf '```\n'
 # v1.2 起不再列 listen port:實測抓到的幾乎都是 NFS/RPC 動態高位 port 與跳板服務,
 # 對交接沒幫助,反而要人去分辨雜訊。對外開放哪些 port 以防火牆規則為準,人工填。
 
-# ── SSL 憑證 ──
-sec "SSL 憑證"
+# ── 2. 憑證 ──
+sec "2. 憑證(SSL)"
 CERT="$DEPLOY_DIR/data/ssl/cert.pem"
 if [ -f "$CERT" ] && have openssl; then
   kv "憑證檔" "$CERT"
@@ -214,8 +327,8 @@ else
   note "找不到 $CERT 或無 openssl(非標準路徑請自行指定)"
 fi
 
-# ── 2. 硬體 ──────────────────────────────
-sec "2. 硬體"
+# ── 3. 硬體 ──────────────────────────────
+sec "3. 硬體"
 if have lscpu; then
   kv "CPU 型號" "$(lscpu 2>/dev/null | grep -E 'Model name' | sed 's/.*: *//')"
   kv "CPU 核心(邏輯)" "$(nproc 2>/dev/null)"
@@ -244,11 +357,18 @@ else
   printf -- '_序號 / 保固 / 供應商需另查(需 sudo;有免密 sudo 時可加 `--with-sudo` 讓腳本抓)_\n'
 fi
 
-# ── 3. OS / 虛擬化 / 邏輯結構 ──────────────────────────────
-sec "3. OS / 虛擬化 / 邏輯結構"
+# ── 4. OS / Docker / 儲存 ──────────────────────────────
+sec "4. OS / Docker / 儲存"
 kv "OS" "$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
 kv "Kernel" "$(uname -r 2>/dev/null)"
-if have systemd-detect-virt; then kv "虛擬化" "$(systemd-detect-virt 2>/dev/null)"; fi
+VIRT=""
+if have systemd-detect-virt; then VIRT="$(systemd-detect-virt 2>/dev/null)"; kv "虛擬化" "$VIRT"; fi
+# v1.9:CPU steal —— 只在 VM 上有意義(實體機恆為 0)。用 /proc/stat 的累積值算佔比,
+# 不用 `vmstat 1 2` 的一秒取樣:那是時點值,上下班差很多。這裡是自開機以來的平均,
+# 持續偏高代表 hypervisor 上被別的 VM 卡住 —— 加 vCPU 也救不了,要找客戶的虛擬化管理者。
+if [ -n "$VIRT" ] && [ "$VIRT" != "none" ] && [ -r /proc/stat ]; then
+  kv "CPU steal(自開機累積)" "$(awk '/^cpu /{t=0; for(i=2;i<=NF;i++) t+=$i; printf "%.2f%%", ($9/t)*100}' /proc/stat 2>/dev/null)"
+fi
 if have docker; then kv "Docker" "$(docker --version 2>/dev/null)"; else note "無 docker"; fi
 printf '### 區塊裝置 / 分割\n```\n'
 # v1.6:-e 7 濾掉 loop 裝置(major 7)。microk8s 是 snap 裝的,AI Landing 主機上
@@ -257,6 +377,38 @@ if have lsblk; then lsblk -e 7 -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>/dev/null; 
 printf '```\n### 磁碟使用 / mount\n```\n'
 if have df; then df -hT 2>/dev/null | grep -vE 'tmpfs|overlay|squashfs'; fi
 printf '```\n'
+# v1.9:NFS 掛載的關鍵參數。上面的 df 只說「掛了誰、用了多少」,這裡說「怎麼掛的」。
+# 對 AI agent 這種要讀整片 WSI(GB 級)的用法,rsize/wsize 與 vers 直接決定吞吐;
+# hard vs soft 決定 NFS 卡住時是無限等待還是回錯(影響服務怎麼壞)。
+# 來源主機不重複列(上面 df 有),只列掛載點與參數,表才不會爆寬。
+printf '### NFS 掛載參數\n'
+# 只認 client 掛載:fstype 精確比對 nfs / nfs4。`$3 ~ /^nfs/` 會把 /proc/fs/nfsd
+# (NFS **server** 的控制用 filesystem)也算進來,實測 demo 機就中了這一槍。
+NFSTBL="$(awk '$3 == "nfs" || $3 == "nfs4" {
+    opts = $4
+    v = "-"; pr = "-"; rs = "-"; ws = "-"; hs = "-"; to = "-"; rt = "-"; ac = "-"
+    n = split(opts, a, ",")
+    for (i = 1; i <= n; i++) {
+      split(a[i], kv, "=")
+      if (kv[1] == "vers" || kv[1] == "nfsvers") v = kv[2]
+      else if (kv[1] == "proto") pr = kv[2]
+      else if (kv[1] == "rsize") rs = kv[2]
+      else if (kv[1] == "wsize") ws = kv[2]
+      else if (kv[1] == "timeo") to = kv[2]
+      else if (kv[1] == "retrans") rt = kv[2]
+      else if (kv[1] == "actimeo") ac = kv[2]
+      else if (a[i] == "hard" || a[i] == "soft") hs = a[i]
+    }
+    printf "%-26s %-5s %-5s %-9s %-9s %-5s %-6s %-8s %s\n", $2, v, pr, rs, ws, hs, to, rt, ac
+  }' /proc/mounts 2>/dev/null)"
+if [ -n "$NFSTBL" ]; then
+  printf '```\n'
+  printf '%-26s %-5s %-5s %-9s %-9s %-5s %-6s %-8s %s\n' mountpoint vers proto rsize wsize hard timeo retrans actimeo
+  printf '%s\n' "$NFSTBL"
+  printf '```\n'
+else
+  printf -- '- 無 NFS 掛載(資料在本機碟)\n'
+fi
 if [ -f /proc/mdstat ] && grep -q '^md' /proc/mdstat 2>/dev/null; then
   printf '### RAID(mdstat)\n```\n'; cat /proc/mdstat 2>/dev/null; printf '```\n'
 fi
@@ -276,11 +428,75 @@ if have vgs; then
     printf -- '- 無 LVM\n'
   fi
 fi
+# v1.8:上面的 mount 是「這台掛了誰的資料」,這裡是反過來「這台把資料分享給誰」。
+# samba 不屬於 aetherSlide 部署(compose 裡沒有 SMB server),有的話一定是站台自建或
+# 客戶 IT 推的,所以只讀設定檔列出分享名與 path,不判斷用途。密碼類鍵不抓。
+printf '### 本機分享出去的目錄(samba)\n'
+SMBCONF=/etc/samba/smb.conf
+if [ ! -f "$SMBCONF" ]; then
+  printf -- '- 無 `%s`(本機沒裝 samba,或用其他方式分享)\n' "$SMBCONF"
+elif [ ! -r "$SMBCONF" ]; then
+  note "$SMBCONF 存在但讀不到(需要 root)"
+else
+  SMBSHARES="$(awk '
+    function flush() {
+      if (name != "" && tolower(name) != "global")
+        printf "%-24s %s\n", name, (path == "" ? "(未設 path)" : path)
+    }
+    /^[ \t]*[;#]/ { next }
+    /^[ \t]*\[/ {
+      flush(); name = $0
+      sub(/^[ \t]*\[/, "", name); sub(/\][ \t]*$/, "", name)
+      path = ""; next
+    }
+    /^[ \t]*[Pp][Aa][Tt][Hh][ \t]*=/ {
+      path = $0; sub(/^[ \t]*[Pp][Aa][Tt][Hh][ \t]*=[ \t]*/, "", path)
+    }
+    END { flush() }
+  ' "$SMBCONF" 2>/dev/null)"
+  if [ -n "$SMBSHARES" ]; then
+    printf '```\n%s\n```\n' "$SMBSHARES"
+    printf -- '- 分享定義的完整內容(`valid users` / `hosts allow` / 唯讀與否)在 `%s`,需要時人工看\n' "$SMBCONF"
+  else
+    printf -- '- `%s` 存在但沒有 `[global]` 以外的分享區段\n' "$SMBCONF"
+  fi
+fi
+# v1.9:同一類的另一半 —— 這台當 NFS server 分享出去的目錄。實測 demo 機有 /proc/fs/nfsd
+# (= 裝了 nfs-kernel-server)才發現 v1.8 只做了 samba 這一半。
+# `exportfs -s` 要 root,所以讀設定檔:/etc/exports 加 /etc/exports.d/*.exports。
+printf '### 本機分享出去的目錄(NFS export)\n'
+EXPFILES=""
+[ -f /etc/exports ] && EXPFILES="/etc/exports"
+for _e in /etc/exports.d/*.exports; do [ -f "$_e" ] && EXPFILES="$EXPFILES $_e"; done
+if [ -z "$EXPFILES" ]; then
+  printf -- '- 無 `/etc/exports`(本機不是 NFS server)\n'
+else
+  EXPLINES=""
+  for _e in $EXPFILES; do
+    if [ -r "$_e" ]; then
+      _l="$(grep -vE '^[[:space:]]*(#|$)' "$_e" 2>/dev/null)"
+      [ -n "$_l" ] && EXPLINES="$EXPLINES$_l
+"
+    else
+      note "$_e 存在但讀不到(需要 root)"
+    fi
+  done
+  if [ -n "$EXPLINES" ]; then
+    printf '```\n%s```\n' "$EXPLINES"
+    printf -- '- 來源檔:`%s`。行格式是 `路徑 client(選項)`;`rw` / `no_root_squash` 這類授權細節照實列出,不解讀\n' "$EXPFILES"
+    # 有 nfsd 在跑但 exports 是空的 = 裝了沒用,跟「沒裝」是兩件事
+  else
+    printf -- '- `%s` 存在但沒有有效的 export 行(只有註解或空行)\n' "$EXPFILES"
+  fi
+fi
+if [ -d /proc/fs/nfsd ]; then
+  printf -- '- **本機有 `/proc/fs/nfsd`**(裝了 `nfs-kernel-server`);它是否真的在服務要看上面的 export 清單\n'
+fi
 
-# ── 4. aetherSlide 部署 ──────────────────────────────
+# ── 5. 執行中的 aetherSlide ──────────────────────────────
 # v1.6:整節用 HAS_AS 包起來。AI 推論主機常常沒有 aetherSlide(GPU 分開裝),
 # 舊版會照樣印出十幾個空欄位與「無執行中 container」,看起來像「裝了但全掛了」。
-sec "4. aetherSlide / AI app 部署"
+sec "5. 執行中的 aetherSlide"
 if [ "$HAS_AS" = "0" ]; then
   note "本機沒有 aetherSlide 部署($DEPLOY_DIR 找不到 configs.env / .env),本節略過"
   note "部署在別的路徑的話用第一個參數指定:bash collect_site_config.sh /path/to/website"
@@ -332,39 +548,8 @@ else
   fi
 fi
 
-# ── 5. 對接與整合設定(從 configs.env 讀,不含任何密碼類鍵)─────────────
-sec "5. 對接與整合設定"
-# v1.5:configs.env 裡的 DICOM / HL7 等鍵就算沒用到也會有預設值,
-# 模組沒列在 MODULES 裡就代表那個服務根本沒起、設定不生效 —— 不註明會讓人以為有對接。
-MODULES_VAL="$(envval "$DEPLOY_DIR/configs.env" MODULES | tr -d ' ')"
-mod_off() {   # 模組不在 MODULES 裡就回傳提示字串
-  if printf '%s' ",$MODULES_VAL," | grep -q ",$1,"; then printf ''
-  else printf '(%s 模組未啟用,此設定不生效)' "$1"; fi
-}
-if [ -f "$DEPLOY_DIR/configs.env" ]; then
-  kv "啟用的模組 MODULES" "${MODULES_VAL:-(空)}"
-  kv "DICOM AE Title" "$(envval "$DEPLOY_DIR/configs.env" WEB_DICOM_SCP__AE_TITLE)$(mod_off dicom)"
-  kv "DICOM SCP 使用者" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__DICOM_SCP_USER)$(mod_off dicom)"
-  kv "HL7v2 訊息編碼" "$(envval "$DEPLOY_DIR/configs.env" WEB_HL7V2_SERVER__MESSAGE_CODEC)$(mod_off hl7v2)"
-  kv "LDAP 整合" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__LDAP_INTEGRATION)(1=開)"
-  kv "LDAP server" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__LDAP_SERVER_URL)"
-  kv "LDAP bind domain" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__LDAP_BIND_DOMAIN)"
-  kv "aetherAI LDAP 登入" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__ENABLE_AETHERAI_LDAP_LOGIN)(1=開)"
-  kv "自動匯入 AUTO_IMPORT" "$(envval "$DEPLOY_DIR/configs.env" AUTO_IMPORT_ENABLED)(1=開),路徑 $(envval "$DEPLOY_DIR/configs.env" AUTO_IMPORT_PATH)$(mod_off auto-import)"
-  kv "分層儲存 GIGASTORE_ENABLE_TIERING" "$(envval "$DEPLOY_DIR/configs.env" GIGASTORE_ENABLE_TIERING)(1=開)"
-  kv "匯出路徑" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__EXPORT_PATH)"
-  kv "NDPI 匯入時轉 DICOM" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__CONVERT_NDPI_TO_DICOM_ON_IMPORT)(1=開)"
-  # v1.6:AI 推論的去向。註解掉時走程式預設(http://dgx.aetherai.com),
-  # 所以「configs.env 沒這行」不等於「沒有 AI 推論」,要標出來而不是留空。
-  AIL_URL="$(envval "$DEPLOY_DIR/configs.env" AI_LANDING_URL)"
-  kv "AI_LANDING_URL(AI 推論端點)" "${AIL_URL:-(未設定 / 被註解 → 走程式預設值,需查該版預設)}"
-  printf -- '_掃描機型號 / PACS-LIS-HIS 對接對象 / 對方 IP 與 port 仍需人工填(設定檔看不出來)_\n'
-else
-  note "讀不到 $DEPLOY_DIR/configs.env"
-fi
-
-# ── 6. 維運排程與時間 ──────────────────────────────
-sec "6. 維運排程與時間"
+# ── 6. 時間與排程 ──────────────────────────────
+sec "6. 時間與排程"
 if have timedatectl; then
   kv "時區 / NTP" "$(timedatectl 2>/dev/null | tr -s ' ' | grep -E 'Time zone|NTP' | paste -sd '; ' -)"
 else
@@ -374,8 +559,10 @@ printf '### 使用者 crontab\n```\n'
 crontab -l 2>/dev/null || printf '(無 crontab 或讀不到)\n'
 printf '```\n'
 if have systemctl; then
+  # v1.8:白名單加 smb/nmb/winbind/nfs-server —— 這類不屬於 aetherSlide,但常常正在
+  # 把 aetherSlide 的資料分享出去(ukt node-1 的 samba 就是這樣被漏掉的)。
   UNITS="$(systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null \
-    | grep -iE 'docker|compose|aetherslide|website|microk8s|kubelet|containerd' | awk '{print $1}')"
+    | grep -iE 'docker|compose|aetherslide|website|microk8s|kubelet|containerd|smbd|nmbd|winbind|nfs-server' | awk '{print $1}')"
   printf '### 相關 systemd service\n'
   if [ -n "$UNITS" ]; then printf '```\n%s\n```\n' "$UNITS"; else printf -- '- 無(可能是人工 `bin/dc up` 起的)\n'; fi
   # 濾掉每台 Ubuntu 都有的 OS 預設 timer,只留這台自己加的
@@ -385,12 +572,12 @@ if have systemctl; then
   if [ -n "$TIMERS" ]; then printf '```\n%s\n```\n' "$TIMERS"; else printf -- '- 無\n'; fi
 fi
 
-# ── 7. AI Landing(AI 推論主機)──────────────────────────────
+# ── 7. GPU node / AI Landing(AI 推論主機)──────────────────────────────
 # v1.6 新增。AI Landing 是 microk8s + helm,不是 docker compose,所以整段是另一套指令。
 # 跟 dual node 不同,這裡「不」自動 SSH 過去:dual 兩台是同一套部署、同一批人裝的,
 # 節點間免密 SSH 還有機會;aetherSlide 與 GPU 主機常屬不同網段甚至不同單位,
 # 自動連只會生一堆失敗訊息,不如明講「到那台再跑一次」。
-sec "7. AI Landing(AI 推論)"
+sec "7. GPU node / AI Landing(AI 推論)"
 if [ "$HAS_AIL" = "0" ]; then
   note "本機沒有 AI Landing(找不到部署目錄的 values.yaml,也沒有 $AIL_NS namespace)"
   if [ -n "${AIL_URL:-}" ]; then
@@ -400,7 +587,7 @@ if [ "$HAS_AIL" = "0" ]; then
       kv "AI_LANDING_URL 指向" "$AIL_URL(是本機 IP,但本機偵測不到 AI Landing → 需人工確認)"
     else
       kv "AI_LANDING_URL 指向" "$AIL_URL(**不是本機**,AI 推論在另一台)"
-      printf -- '- _請到那台主機再跑一次本腳本,把第 7 節貼進同一份 site config:_\n'
+      printf -- '- _請到那台主機再跑一次本腳本,把它的第 1–7 段貼進站頁 M-machine 的「GPU node」段:_\n'
       printf '```\nbash collect_site_config.sh --no-remote\n```\n'
       printf -- '- _FQDN 的話實際 IP 由客戶 DNS/NAT 決定,要人工確認解析到哪台_\n'
     fi
@@ -540,13 +727,45 @@ else
   printf -- '_哪些 aetherSlide 站台連這台、GPU 由誰採購保固、模型更新誰做,設定看不出來,要人工填_\n'
 fi
 
-# ── 8. 另一個節點(dual;SSH 一次收齊兩台)──────────────────────────────
+# ── 8. 對接與整合設定(從 configs.env 讀,不含任何密碼類鍵)─────────────
+# 這段屬 M-config 層(設定檔說了什麼),不是機器現況 —— 貼到站頁的「對接(整合)」。
+sec "8. 對接與整合設定(→ 貼到 M-config 的「對接(整合)」)"
+# v1.5:configs.env 裡的 DICOM / HL7 等鍵就算沒用到也會有預設值,
+# 模組沒列在 MODULES 裡就代表那個服務根本沒起、設定不生效 —— 不註明會讓人以為有對接。
+MODULES_VAL="$(envval "$DEPLOY_DIR/configs.env" MODULES | tr -d ' ')"
+mod_off() {   # 模組不在 MODULES 裡就回傳提示字串
+  if printf '%s' ",$MODULES_VAL," | grep -q ",$1,"; then printf ''
+  else printf '(%s 模組未啟用,此設定不生效)' "$1"; fi
+}
+if [ -f "$DEPLOY_DIR/configs.env" ]; then
+  kv "啟用的模組 MODULES" "${MODULES_VAL:-(空)}"
+  kv "DICOM AE Title" "$(envval "$DEPLOY_DIR/configs.env" WEB_DICOM_SCP__AE_TITLE)$(mod_off dicom)"
+  kv "DICOM SCP 使用者" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__DICOM_SCP_USER)$(mod_off dicom)"
+  kv "HL7v2 訊息編碼" "$(envval "$DEPLOY_DIR/configs.env" WEB_HL7V2_SERVER__MESSAGE_CODEC)$(mod_off hl7v2)"
+  kv "LDAP 整合" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__LDAP_INTEGRATION)(1=開)"
+  kv "LDAP server" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__LDAP_SERVER_URL)"
+  kv "LDAP bind domain" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__LDAP_BIND_DOMAIN)"
+  kv "aetherAI LDAP 登入" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__ENABLE_AETHERAI_LDAP_LOGIN)(1=開)"
+  kv "自動匯入 AUTO_IMPORT" "$(envval "$DEPLOY_DIR/configs.env" AUTO_IMPORT_ENABLED)(1=開),路徑 $(envval "$DEPLOY_DIR/configs.env" AUTO_IMPORT_PATH)$(mod_off auto-import)"
+  kv "分層儲存 GIGASTORE_ENABLE_TIERING" "$(envval "$DEPLOY_DIR/configs.env" GIGASTORE_ENABLE_TIERING)(1=開)"
+  kv "匯出路徑" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__EXPORT_PATH)"
+  kv "NDPI 匯入時轉 DICOM" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__CONVERT_NDPI_TO_DICOM_ON_IMPORT)(1=開)"
+  # AI 推論的去向。註解掉時走程式預設(舊版預設是已廢棄的 http://dgx.aetherai.com),
+  # 所以「configs.env 沒這行」不等於「沒有 AI 推論」,要標出來而不是留空。
+  # (AIL_URL 在檔案上方就算好了,見 v1.7 註記)
+  kv "AI_LANDING_URL(AI 推論端點)" "${AIL_URL:-(未設定 / 被註解 → 走程式預設值,需查該版預設)}"
+  printf -- '_掃描機型號 / PACS-LIS-HIS 對接對象 / 對方 IP 與 port 仍需人工填(設定檔看不出來)_\n'
+else
+  note "讀不到 $DEPLOY_DIR/configs.env"
+fi
+
+# ── 9. 另一個節點(dual;SSH 一次收齊兩台)──────────────────────────────
 # 遠端跑的是同一份腳本(從 stdin 餵過去,不落地),並帶 --no-remote 避免互相遞迴。
 PEER_TARGET="$PEER"
 [ -n "$PEER_TARGET" ] || { [ "$ARCH" = "dual" ] && PEER_TARGET="$PEER_IP"; }
 
 if [ "$DO_REMOTE" = "1" ] && [ -n "$PEER_TARGET" ]; then
-  sec "8. 另一個節點(遠端採集:$PEER_TARGET)"
+  sec "9. 另一個節點(遠端採集:$PEER_TARGET)"
   REMOTE_ARGS="--remote-child"
   [ "$DEPLOY_DIR_EXPLICIT" = "1" ] && REMOTE_ARGS="$REMOTE_ARGS '$DEPLOY_DIR'"
   if [ -z "$SELF" ] || [ ! -r "$SELF" ]; then
@@ -565,7 +784,7 @@ if [ "$DO_REMOTE" = "1" ] && [ -n "$PEER_TARGET" ]; then
   fi
   rm -f /tmp/.sc_ssh_err 2>/dev/null
 elif [ "$ARCH" = "dual" ] && [ "$CHILD" = "0" ]; then
-  sec "8. 另一個節點"
+  sec "9. 另一個節點"
   if [ "$DO_REMOTE" = "0" ]; then
     note "--no-remote:只採本機,另一台請自行執行"
   else
@@ -574,5 +793,5 @@ elif [ "$ARCH" = "dual" ] && [ "$CHILD" = "0" ]; then
 fi
 
 [ "$CHILD" = "0" ] &&
-  printf '\n---\n_採集完成。硬體序號/保固、對接整合、聯絡窗口等需人工填寫的欄位不在此輸出。_\n'
+  printf '\n---\n_採集完成。硬體序號/保固、對接對方是誰、聯絡窗口等需人工填寫的欄位不在此輸出(屬站頁 H 層)。_\n'
 exit 0
