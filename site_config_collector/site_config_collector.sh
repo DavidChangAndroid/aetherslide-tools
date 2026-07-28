@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
-# collect_site_config.sh v1.9 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 Obsidian
+# collect_site_config.sh v1.10 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 Obsidian
 # site config 站頁(標「腳本」的欄位)。
+#
+# v1.10 相對 v1.9(ukt 實跑後的修正,只動 CPU steal 一處):
+#   **VMware / Hyper-V 的 guest 量不到 CPU steal**。v1.9 在 ukt 兩台 vmware VM 上印 0.00%,
+#   看起來像「hypervisor 沒超賣」,其實是那兩家 hypervisor 根本不透過 steal time 機制回報
+#   CPU 競爭 —— 印一個看似正常的 0 比不印還糟。現在依 systemd-detect-virt 分流:
+#   vmware / microsoft 直接標「量不到」並指到 vSphere 的 CPU Ready(%RDY);
+#   kvm / xen / 雲端 VM 才照舊算 /proc/stat 的累積佔比。
+#   ⚠ 版號 V1.10 > V1.9 —— `ls` 的字典序會排錯,但 publish.sh 用的是 `sort -V`(版本排序),
+#     選版正確;說明文件的「目前最新」欄以人工標示為準。
 #
 # v1.9 相對 v1.8:補網路與儲存的「容量與健康」欄位,用途是評估**未來把 AI agent
 #   接進 aetherSlide** 時,現有環境撐不撐得住(agent 若要讀影像,每片是 GB 級,
@@ -79,7 +88,7 @@ while [ $# -gt 0 ]; do
     --no-remote) DO_REMOTE=0; shift ;;
     --remote-child) CHILD=1; DO_REMOTE=0; shift ;;
     -h|--help)
-      sed -n '2,55p' "${SELF:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'
+      sed -n '2,66p' "${SELF:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) DEPLOY_DIR="$1"; DEPLOY_DIR_EXPLICIT=1; shift ;;
   esac
@@ -363,11 +372,24 @@ kv "OS" "$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
 kv "Kernel" "$(uname -r 2>/dev/null)"
 VIRT=""
 if have systemd-detect-virt; then VIRT="$(systemd-detect-virt 2>/dev/null)"; kv "虛擬化" "$VIRT"; fi
-# v1.9:CPU steal —— 只在 VM 上有意義(實體機恆為 0)。用 /proc/stat 的累積值算佔比,
+# CPU steal —— 只在 VM 上有意義(實體機恆為 0)。用 /proc/stat 的累積值算佔比,
 # 不用 `vmstat 1 2` 的一秒取樣:那是時點值,上下班差很多。這裡是自開機以來的平均,
 # 持續偏高代表 hypervisor 上被別的 VM 卡住 —— 加 vCPU 也救不了,要找客戶的虛擬化管理者。
+#
+# v1.10:**但這只在會回報 steal time 的 hypervisor 上成立**。VMware / Hyper-V 不透過
+# steal time 機制暴露 CPU 競爭,guest 的 /proc/stat steal 幾乎恆為 0 —— v1.9 在 ukt 兩台
+# vmware VM 上就印出 0.00%,看起來像「沒被超賣」,其實是「量不到」。**印一個看似正常的 0
+# 比不印還糟**,所以這類 hypervisor 直接標明量不到,並指到該去看哪個指標。
 if [ -n "$VIRT" ] && [ "$VIRT" != "none" ] && [ -r /proc/stat ]; then
-  kv "CPU steal(自開機累積)" "$(awk '/^cpu /{t=0; for(i=2;i<=NF;i++) t+=$i; printf "%.2f%%", ($9/t)*100}' /proc/stat 2>/dev/null)"
+  case "$VIRT" in
+    vmware)
+      kv "CPU steal" "**量不到(VMware)** —— VMware 不透過 steal time 回報 CPU 競爭,guest 讀到的一律接近 0。要判斷有沒有被超賣,看 vSphere 側的 **CPU Ready(%RDY)** 與 Co-Stop,**腳本問不到,要向客戶的虛擬化管理者要**" ;;
+    microsoft)
+      kv "CPU steal" "**量不到(Hyper-V)** —— 同 VMware,要看 hypervisor 側的 CPU wait time per dispatch" ;;
+    *)
+      # kvm / xen / 各家雲的 VM 都有 steal,這裡才有意義
+      kv "CPU steal(自開機累積)" "$(awk '/^cpu /{t=0; for(i=2;i<=NF;i++) t+=$i; printf "%.2f%%", ($9/t)*100}' /proc/stat 2>/dev/null)($VIRT)" ;;
+  esac
 fi
 if have docker; then kv "Docker" "$(docker --version 2>/dev/null)"; else note "無 docker"; fi
 printf '### 區塊裝置 / 分割\n```\n'
