@@ -1,6 +1,38 @@
 #!/usr/bin/env bash
-# collect_site_config.sh v1.11 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 Obsidian
+# collect_site_config.sh v1.12 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 Obsidian
 # site config 站頁(標「腳本」的欄位)。
+#
+# v1.12 相對 v1.11 —— **儲存段整組加深(第 4 段),回答三個舊版答不出來的問題**:
+#   ① **幾顆碟**:新增「實體碟總覽」(`lsblk -d`:容量 / HDD-SSD / 介面 / 型號 / 序號 + 顆數統計)。
+#      舊版只有分割樹,要人自己數,也看不出型號與是不是 SSD。
+#      **顆數會說話**:MODEL 出現 `PERC` / `MegaRAID` / `LOGICAL VOLUME` / VMware 虛擬碟時多印一行
+#      「這個顆數不是實體硬碟數」—— 硬體 RAID 站台 OS 只看到 1 顆 virtual disk,底下可能是 8 顆,
+#      不標的話「硬碟總數 1」是錯的。
+#   ② **軟體 RAID 狀態**:md 段改成**一律印結論**(舊版沒有 md 時整段消失,讀者分不出
+#      「沒有軟 RAID」還是「腳本沒查」),並從 mdstat 的 `[U_]` / `(F)` / `recovery` 直接判
+#      **degraded / faulty / 重建中**(純文字判斷,不需 root)。`--with-sudo` 再補 `mdadm --detail`
+#      (RAID level / 幾顆 / State / 重建進度)。另加 ZFS(`zpool status -x`)與 btrfs 兩種軟 RAID,
+#      LVM 的 `lvs` 加 `segtype`(看得出 linear 還是 raid1/mirror)。
+#   ③ **硬體 RAID 狀態**:舊版完全空白。現在先用 `lspci` 印控制器型號(非 root 可讀),再找廠商
+#      CLI(storcli / perccli / MegaCli / ssacli / arcconf / sas3ircu / tw_cli,PATH 加 /opt 常見路徑),
+#      有 CLI 就跑**唯讀** show 指令抓 VD / PD 狀態;**都沒有就明寫「量不到,要走 BMC」** ——
+#      同 v1.10/v1.11 的原則:寧可標明量不到,也不要讓 `mdstat 正常` 被誤讀成「陣列沒問題」。
+#   ④ **SMART**:每顆碟的整體健康判定(PASSED / FAILED)。**刻意只取這一行** —— 通電時數、
+#      重配置磁區、NVMe 壽命% 不抓(那是維運監控,不是環境紀錄)。裝置清單優先用
+#      `smartctl --scan-open`,因為 RAID 控制器後面的碟要 `-d megaraid,N` 才問得到。
+#   ⑤ 第 6 段執行中 service 的白名單加 `smartd|mdmonitor|zed|multipathd` —— 有沒有人在監控 RAID
+#      跟 RAID 現在好不好是兩件事,交接都要知道。
+#   ⑥ **實跑(demo 機 + ukt 儲存主機)修掉的**:表頭一律 ASCII(中文佔兩格會跟資料列錯開,
+#      同 v1.11 的釘子);「沒有陣列」與「有陣列但量不到」要講不同的話(不能無中生有缺口);
+#      判斷 virtual disk 要連 `VENDOR` 一起看(MegaRAID 的 VD 型號是 `MRROMB`,看不出跟 RAID 有關)
+#      且警語要指名是哪幾顆;控制器偵測提前到第 4 段開頭(否則「實體碟總覽」讀不到);
+#      新增「掛載中但 lsblk 沒列」檢查(ukt 有顆 93% 滿的碟掉出 /sys/block 但掛載還在);
+#      `external:imsm` 的 `inactive` 是正常的,要多印一行解釋免得被當成故障。
+#   ⚠ **③④ 需要 root,且這兩項是「沒有它就完全量不到」的欄位**,所以與 dmidecode / LVM 的
+#     `sudo -n`(沒權限就靜默略過)不同:`--with-sudo` 時允許**互動輸入密碼**。密碼只問一次
+#     (先 `sudo -v` 取 timestamp,之後每條查詢一律 `sudo -n`),且只在有 tty 時問 ——
+#     dual node 的 SSH child 沒有 tty,會自動退回「略過並註記」,不會卡在那裡等輸入。
+#     不想給密碼就在提示時按 Ctrl-D(或連按 Enter),其餘採集完全不受影響。
 #
 # v1.11 相對 v1.10(與 v1.10 同一個教訓的第二個實例:值本身要會說話,不能只靠引言警語):
 #   **虛擬網卡的 speed 加 `*` 標記**。v1.10 的介面明細表在 ukt 兩台 vmware VM 上照印
@@ -51,8 +83,10 @@
 #   不是機器現況,夾在機器段中間會讓人把它貼錯區塊。
 #
 # 安全性:全程唯讀,不安裝、不修改、不需 sudo。可直接在正式機執行。
-#   (--with-sudo 例外:多跑一個 `sudo -n dmidecode` 抓硬體序號,仍是唯讀查詢;
-#    用 -n 不會問密碼,沒權限就自動略過。)
+#   (--with-sudo 例外:多跑 `dmidecode`(硬體序號)、`mdadm --detail`、廠商 RAID CLI 的 show
+#    指令、`smartctl -H`,全部是唯讀查詢,不改陣列、不觸發自我檢測。
+#    dmidecode 與 LVM 用 `sudo -n`(沒權限就靜默略過);RAID / SMART 因為「沒 root 就完全
+#    量不到」,允許互動輸入密碼 —— 只問一次、只在有 tty 時問,不想給就按 Ctrl-D 跳過。)
 # 用法:
 #   在站台上執行:  bash collect_site_config.sh [部署目錄] [--peer [user@]host] [--no-remote] [--with-sudo]
 #                                              [--ai-landing-dir 目錄]
@@ -98,7 +132,7 @@ while [ $# -gt 0 ]; do
     --no-remote) DO_REMOTE=0; shift ;;
     --remote-child) CHILD=1; DO_REMOTE=0; shift ;;
     -h|--help)
-      sed -n '2,76p' "${SELF:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'
+      sed -n '2,110p' "${SELF:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) DEPLOY_DIR="$1"; DEPLOY_DIR_EXPLICIT=1; shift ;;
   esac
@@ -106,6 +140,34 @@ done
 [ -n "$DEPLOY_DIR" ] || DEPLOY_DIR="$HOME/website"
 
 have() { command -v "$1" >/dev/null 2>&1; }
+# v1.12:RAID 控制器狀態與 SMART 沒有 root 就完全量不到(不像序號還能看機器標籤),
+# 所以這兩項允許互動輸入密碼。設計上要避免兩件事:
+#   ① 問很多次 —— 先用 `sudo -v` 取得 timestamp,取到之後每條查詢都走 `sudo -n`(不會再問)。
+#   ② 在沒有 tty 的環境卡住等輸入 —— dual node 的 SSH child(`ssh host bash -s`,沒有 -t)
+#      就是這種情況。沒 tty 直接判定不可用,退回「略過並註記」。
+#   ③ **腳本本身是從 stdin 餵進來時,絕對不能問密碼**(`bash -s < script` / `curl | bash`)。
+#      那種跑法 stdin 就是腳本內容,sudo 讀 /dev/tty 會跟腳本搶同一條管線 —— 有人硬加
+#      `ssh -tt` 的話,sudo 會把腳本剩下的位元組當成密碼吃掉。判準用 `$SELF`:
+#      它有值且讀得到 = 腳本來自真實檔案,stdin 沒有被佔用。(2026-07-29 實跑時發現:
+#      `ssh -t host 'bash -s' < script` 連 pty 都拿不到,ssh 會直接說 stdin 不是終端機。)
+#   密碼提示與說明一律走 stderr,stdout 只有報告本文(使用者常 `> site.md`)。
+SUDO_OK=-1   # -1=還沒試 0=不可用 1=可用
+sudo_ready() {
+  [ "$WITH_SUDO" = "1" ] || return 1
+  have sudo || return 1
+  if [ "$SUDO_OK" = "-1" ]; then
+    if sudo -n true 2>/dev/null; then
+      SUDO_OK=1
+    elif [ -t 2 ] && [ "$CHILD" = "0" ] && [ -n "$SELF" ] && [ -r "$SELF" ]; then
+      printf '\n[collect_site_config] 需要 sudo 才能讀 RAID 控制器與 SMART 狀態(唯讀查詢,不改任何設定)。\n' >&2
+      printf '[collect_site_config] 密碼只問這一次;不想給就按 Ctrl-D 跳過,其餘採集不受影響。\n' >&2
+      if sudo -v; then SUDO_OK=1; else SUDO_OK=0; printf '[collect_site_config] 略過需要 root 的 RAID / SMART 欄位。\n' >&2; fi
+    else
+      SUDO_OK=0
+    fi
+  fi
+  [ "$SUDO_OK" = "1" ]
+}
 sec()  { printf '\n## %s\n\n' "$1"; }
 kv()   { printf -- '- **%s**: %s\n' "$1" "$2"; }
 note() { printf -- '- _(略過:%s)_\n' "$1"; }
@@ -425,13 +487,137 @@ if [ -n "$VIRT" ] && [ "$VIRT" != "none" ] && [ -r /proc/stat ]; then
   esac
 fi
 if have docker; then kv "Docker" "$(docker --version 2>/dev/null)"; else note "無 docker"; fi
+# v1.12(ukt 實跑修正):儲存控制器的偵測要**提早在這裡**算,不能等到下面的「硬體 RAID」段 ——
+# 「實體碟總覽」需要它來判斷顆數可不可信。同 v1.7 那個教訓:值算太晚,前面的段就讀不到。
+HWCTL=""
+have lspci && HWCTL="$(lspci 2>/dev/null | grep -iE 'RAID bus controller|Serial Attached SCSI controller|Mass storage controller|SATA controller|Non-Volatile memory controller')"
+HW_CTL_RAID=0
+printf '%s\n' "$HWCTL" | grep -qi 'RAID bus controller' && HW_CTL_RAID=1
+IMSM_SEEN=0   # 下面 md 段偵測到 Intel RST 時設 1;硬體 RAID 段要用(md 段在它前面)
+# v1.12:先回答「這台幾顆碟」。舊版只有下面的分割樹,要人自己數,而且看不出容量以外的事
+# (是 SSD 還是 HDD、什麼介面、什麼型號)。
+# 用 `-P`(key="value")而不是欄位對齊格式:MODEL 常含空白(`PERC H730P Mini`),
+# 用欄位切割會被切成兩欄,序號跟著跑位。
+printf '### 實體碟總覽\n'
+DISKROWS=""
+# 這兩個旗標會傳到下面的「硬體 RAID」段用:碟的型號本身就是「這台的碟是誰做出來的」的線索。
+HW_RAID_HINT=0    # 型號看起來是 RAID 控制器做出來的 virtual disk
+HW_VDISK_HINT=0   # 型號看起來是 hypervisor 給的虛擬碟
+VDRAID=""         # 命中前者的裝置名(空白分隔)
+VDVIRT=""         # 命中後者的裝置名
+if have lsblk; then
+  # VENDOR 一起抓:ukt 實跑證明**只看 MODEL 不夠** —— MegaRAID 做出來的 VD 型號是 `MRROMB`
+  # (MegaRAID ROMB),字面上完全看不出跟 RAID 有關,但 VENDOR 會是 AVAGO / LSI / DELL。
+  # VENDOR 不進表(表已經 6 欄),只用來判斷這一列是不是 virtual disk。
+  DISKRAW="$(lsblk -dn -P -e 7,11 -o NAME,SIZE,ROTA,TRAN,TYPE,VENDOR,MODEL,SERIAL 2>/dev/null | awk '
+    function g(s, k,   r) {
+      r = ""
+      if (match(s, k "=\"[^\"]*\"")) { r = substr(s, RSTART, RLENGTH); sub(k "=\"", "", r); sub(/"$/, "", r) }
+      return r
+    }
+    {
+      # -d 也會列出 md / dm 這類組合裝置(TYPE=raid1 / lvm),那不是實體碟,不算進顆數
+      if (g($0, "TYPE") != "disk") next
+      name = g($0, "NAME"); size = g($0, "SIZE"); rota = g($0, "ROTA")
+      tran = g($0, "TRAN"); vend = g($0, "VENDOR"); model = g($0, "MODEL"); ser = g($0, "SERIAL")
+      kind = (rota == "1" ? "HDD" : (rota == "0" ? "SSD/NVMe" : "?"))
+      if (kind == "HDD") hdd++; else if (kind == "SSD/NVMe") ssd++; else unk++
+      n++
+      # 廠牌 + 型號一起比對,並把命中的裝置名收起來 —— 警語要能指名道姓說「哪幾列」,
+      # 只說「有一列是 VD」讀者還是得自己猜。
+      vm = vend " " model
+      if (vm ~ /(PERC|MegaRAID|MRROMB|MR9|LSI|AVAGO|Broadcom|ServeRAID|Smart Array|Adaptec|LOGICAL VOLUME)/) vdr = vdr " " name
+      if (vm ~ /(VMware|Virtual disk|Virtual HD|QEMU HARDDISK|VBOX|Msft)/) vdv = vdv " " name
+      printf "%-12s %-8s %-9s %-6s %-30s %s\n", name, size, kind, \
+             (tran == "" ? "-" : tran), (model == "" ? "-" : model), (ser == "" ? "-" : ser)
+    }
+    END {
+      printf "@@COUNT %d %d %d %d\n", n, hdd+0, ssd+0, unk+0
+      printf "@@VDRAID%s\n", vdr
+      printf "@@VDVIRT%s\n", vdv
+    }
+  ')"
+  DCOUNT="$(printf '%s\n' "$DISKRAW" | sed -n 's/^@@COUNT //p')"
+  VDRAID="$(printf '%s\n' "$DISKRAW" | sed -n 's/^@@VDRAID *//p')"
+  VDVIRT="$(printf '%s\n' "$DISKRAW" | sed -n 's/^@@VDVIRT *//p')"
+  DISKROWS="$(printf '%s\n' "$DISKRAW" | grep -v '^@@')"
+  kv "OS 看得到的碟" "$(printf '%s' "$DCOUNT" | awk '{print $1" 顆(HDD "$2" / SSD-NVMe "$3" / 未知 "$4")"}')"
+  if [ -n "$DISKROWS" ]; then
+    printf '```\n'
+    # 表頭用 ASCII:中文在等寬字型佔兩格,`printf %-Ns` 按字元數算,用「類型 / 介面」當表頭
+    # 會讓表頭與資料列對不齊(v1.11 已經在網卡那張表踩過同一顆釘子,那次的解法是改用 `*`)。
+    printf '%-12s %-8s %-9s %-6s %-30s %s\n' NAME SIZE HDD/SSD BUS MODEL SERIAL
+    printf '%s\n' "$DISKROWS"
+    printf '```\n'
+  fi
+  # 值本身要會說話(同 v1.10/v1.11):硬體 RAID 站台的 OS 只看到控制器做出來的 virtual disk,
+  # 底下幾十顆碟在 lsblk 一律看不到 —— 不標的話這個顆數是錯的答案。
+  # 分成「控制器做的」與「hypervisor 做的」兩種,因為要去問的人不同:前者走 BMC / 廠商 CLI,
+  # 後者只能問客戶的虛擬化管理者(BMC 也看不到 guest 的虛擬碟底下是什麼)。
+  [ -n "$VDRAID" ] && HW_RAID_HINT=1
+  [ -n "$VDVIRT" ] && HW_VDISK_HINT=1
+  # v1.12(tph 實跑修正):**型號比對抓不完虛擬碟**。tph 是 AWS,型號是
+  # `Amazon Elastic Block Store`(EBS,網路連接的 block storage),不在任何比對清單裡,
+  # 所以照印「1 顆」而沒有任何標注 —— 跟 ukt 的 `MRROMB` 是同一個錯,只是換成雲端。
+  # 各家雲與虛擬化平台的碟型號列不完(`Google PersistentDisk`、`Virtual disk`、`QEMU`…),
+  # 所以主判準改用 **systemd-detect-virt**:只要這台是 VM,上面的碟就一定不是實體碟。
+  { [ -n "$VIRT" ] && [ "$VIRT" != "none" ]; } && HW_VDISK_HINT=1
+  if [ -n "$VDRAID" ]; then
+    printf -- '- **注意:上面的顆數不等於實體硬碟數**。`%s` 的廠牌 / 型號是 RAID 控制器做出來的 **virtual disk**(一列可能是一整櫃碟),**底下真正幾顆碟、哪一顆壞了 `lsblk` 一律看不到** —— 看下面「硬體 RAID(控制器)」段,或走 BMC。\n' "$VDRAID"
+  elif [ "$HW_CTL_RAID" = "1" ]; then
+    # 型號沒露餡但機器上確實有 RAID 卡:講可能性,不要講成事實
+    printf -- '- **注意:這台有 RAID 控制器**(見下方「硬體 RAID(控制器)」)。若其中某一列其實是控制器做出來的 virtual disk,**上面的顆數就不是實體硬碟數** —— 拿廠商 CLI 的 VD 容量對照上表就知道是哪一列。\n'
+  fi
+  if [ "$HW_VDISK_HINT" = "1" ]; then
+    # 指名道姓優先(型號有露餡就列裝置名),否則就說「上面所有的碟」
+    _vdwho="$([ -n "$VDVIRT" ] && printf '`%s`' "$VDVIRT" || printf '上面所有的碟')"
+    case "$VIRT" in
+      amazon|gce|azure|oracle|alibaba)
+        # 雲端跟地端 hypervisor 要問的人不同,而且雲端**沒有 BMC 可看**,不能照抄同一句話
+        printf -- '- **注意:這是雲端 VM(`%s`),%s 不是實體碟**,是雲端的網路 block storage(EBS / PD 這類)。顆數等於掛了幾個 volume,**跟底層有幾顆實體碟無關**;容量與 IOPS 由 volume 規格決定,要看雲端 console。**實體碟是雲端業者的,沒有 BMC 可查,SMART 也沒有意義。**\n' "$VIRT" "$_vdwho" ;;
+      *)
+        printf -- '- **注意:%s 是 hypervisor(`%s`)給的虛擬碟**,顆數與容量都是 guest 視角。底下實際是幾顆碟、有沒有做 RAID、放在哪個 datastore / LUN,**guest 完全看不到,也不在這台的 BMC 上** —— 只能問客戶的虛擬化管理者。\n' "$_vdwho" "${VIRT:-未知}" ;;
+    esac
+  fi
+  printf -- '- _SERIAL 空白 = udev 沒提供(virtual disk、部分 RAID 後端與 VM 常見),不是抓失敗_\n'
+else
+  note "無 lsblk,碟數與型號要人工查"
+fi
 printf '### 區塊裝置 / 分割\n```\n'
 # v1.6:-e 7 濾掉 loop 裝置(major 7)。microk8s 是 snap 裝的,AI Landing 主機上
 # 實測有 29 個 squashfs loop,把真正的磁碟結構整個淹掉 —— 跟 veth 洪水同一類問題。
-if have lsblk; then lsblk -e 7 -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>/dev/null; else note "無 lsblk"; fi
+# v1.12(tph 實跑修正):結尾多一個 `| cat`。lsblk 會依終端機寬度截斷最後一欄 ——
+# 直接在終端機看時 tph 的表頭印成 `MOUNTPOIN`(掛載路徑長一點就會被切掉)。
+# stdout 是 pipe 時 lsblk 不截斷,所以 `| cat` 就解決了(導向檔案時本來就不會截,這是為了
+# 「在終端機跑完直接複製貼上」那種用法 —— 而那正是實際最常見的用法)。
+if have lsblk; then lsblk -e 7 -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>/dev/null | cat; else note "無 lsblk"; fi
 printf '```\n### 磁碟使用 / mount\n```\n'
 if have df; then df -hT 2>/dev/null | grep -vE 'tmpfs|overlay|squashfs'; fi
 printf '```\n'
+# v1.12(ukt 實跑發現):那台 `df` 有 `/dev/sde6`(668G,93% 滿,掛在 /mnt/usb),
+# 但 `lsblk` 從頭到尾沒有 sde —— 裝置已經不在 /sys/block(碟被拔掉 / 從控制器上掉了 /
+# 熱插拔後沒重掛),掛載卻還留著,`df` 照樣給數字。
+# **這種碟不會出現在「實體碟總覽」的顆數裡**,不標的話那個顆數會被當成完整清單。
+# 站頁模板 C4「`df` 看得到但 `lsblk` 沒列的碟」本來要人工發現,這裡直接算給他。
+if have lsblk && [ -r /proc/mounts ]; then
+  LSBLK_ALL="$(lsblk -alno NAME 2>/dev/null | tr -d ' ' | sort -u)"
+  GHOSTDEV=""
+  for _md in $(awk '$1 ~ /^\/dev\// {print $1}' /proc/mounts 2>/dev/null | sort -u); do
+    _b="${_md#/dev/}"
+    # 只比對得了「單純的裝置名」。以下三類在 lsblk 是另一個名字,比對會產生假警報 ——
+    # 而一個假的「碟掉了」比不報還糟(同 v1.12 那條「不要無中生有缺口」的教訓):
+    #   ① dm / mapper:/dev/mapper/ubuntu--vg-ubuntu--lv,lsblk 叫 ubuntu--vg-ubuntu--lv
+    #   ② 任何帶 `/` 的路徑:/dev/disk/by-uuid/... 這種 symlink 形式(部分系統的 /proc/mounts 就長這樣)
+    #   ③ /dev/root:initramfs 交接後的別名,lsblk 沒有這個名字
+    case "$_b" in */*|dm-*|root) continue ;; esac
+    printf '%s\n' "$LSBLK_ALL" | grep -qx "$_b" || GHOSTDEV="$GHOSTDEV $_b"
+  done
+  # 前導空白要砍:GHOSTDEV 是用空白累加的,直接塞進反引號會印成 `` ` sde6` ``(實測 ukt 就這樣)
+  GHOSTDEV="${GHOSTDEV# }"
+  if [ -n "$GHOSTDEV" ]; then
+    printf -- '- **注意:有掛載中的裝置不在 `lsblk` 清單裡** —— `%s`。代表裝置已經不在 `/sys/block`(碟被拔掉、從控制器上掉了、或熱插拔後沒重掛),但掛載還在,所以 `df` 照樣有數字。**這種碟不算在上面的顆數裡,而且上面的容量數字未必還可信。** 照實記錄、不要自己判斷用途(站頁模板 C4 收這一類)。\n' "$GHOSTDEV"
+  fi
+fi
 # v1.9:NFS 掛載的關鍵參數。上面的 df 只說「掛了誰、用了多少」,這裡說「怎麼掛的」。
 # 對 AI agent 這種要讀整片 WSI(GB 級)的用法,rsize/wsize 與 vers 直接決定吞吐;
 # hard vs soft 決定 NFS 卡住時是無限等待還是回錯(影響服務怎麼壞)。
@@ -464,15 +650,57 @@ if [ -n "$NFSTBL" ]; then
 else
   printf -- '- 無 NFS 掛載(資料在本機碟)\n'
 fi
-if [ -f /proc/mdstat ] && grep -q '^md' /proc/mdstat 2>/dev/null; then
-  printf '### RAID(mdstat)\n```\n'; cat /proc/mdstat 2>/dev/null; printf '```\n'
+# v1.12:舊版「沒有 md 就整段不印」,讀者分不出「這台沒有軟體 RAID」與「腳本沒查這件事」——
+# 跟 CPU steal 那個教訓同一類,所以改成一律印結論。
+# 另外只把 mdstat 原文貼出來是不夠的:degraded 在 `[U_]` 那一格,兩個字元,會被滑過去。
+printf '### 軟體 RAID(md)\n'
+if [ ! -r /proc/mdstat ]; then
+  printf -- '- 讀不到 `/proc/mdstat`(kernel 沒有 md 模組)\n'
+elif ! grep -q '^md' /proc/mdstat 2>/dev/null; then
+  printf -- '- **無 active md array** —— 這台沒有 Linux 軟體 RAID。碟若有做 RAID,是在控制器層或 hypervisor 做的(見下方「硬體 RAID(控制器)」)\n'
+else
+  MDSTAT="$(cat /proc/mdstat 2>/dev/null)"
+  MDBAD=""
+  # 狀態列 [UU] 全 U = 成員都在線;出現 _ 就是缺成員
+  printf '%s\n' "$MDSTAT" | grep -qE '\[[U_]*_[U_]*\]' && MDBAD="degraded(狀態列出現 \`_\`,有成員不在線)"
+  printf '%s\n' "$MDSTAT" | grep -q '(F)' && MDBAD="${MDBAD:+$MDBAD;}有成員被標記 faulty \`(F)\`"
+  printf '%s\n' "$MDSTAT" | grep -qE 'recovery|resync|reshape' && MDBAD="${MDBAD:+$MDBAD;}正在重建 / 同步中"
+  if [ -n "$MDBAD" ]; then
+    kv "md 陣列健康" "**異常 — $MDBAD**"
+  else
+    kv "md 陣列健康" "成員全部在線(狀態列無 \`_\`)。**這不代表碟是健康的** —— 硬碟壽命看下方 SMART"
+  fi
+  printf '```\n%s\n```\n' "$MDSTAT"
+  # v1.12(ukt 實跑補的):那台的 root 跑在 Intel RST(主機板 fakeRAID)上,mdstat 長這樣:
+  #   md126 : active raid1 sda[1] sdb[0] ... super external:/md127/0 [2/2] [UU]
+  #   md127 : inactive sda[1](S) sdb[0](S) ... super external:imsm
+  # **`inactive` 那一行是 metadata container,不是壞掉的陣列** —— 每台 Intel RST 機器都長這樣。
+  # 不解釋的話交接的人看到 inactive 會以為出事(而判定式又說「成員全部在線」,更混亂)。
+  if printf '%s\n' "$MDSTAT" | grep -q 'external:imsm'; then
+    IMSM_SEEN=1
+    printf -- '- _`external:imsm` = **Intel RST(主機板 fakeRAID)**,不是 Linux 原生 md 也不是硬體 RAID 卡:陣列由主機板 BIOS 定義、由 kernel 的 md 驅動實際運作。其中 `inactive … (S)` 那一行是 **metadata container,顯示 inactive 是正常的**,真正的陣列是它上面那個 `active` 的 md。要換碟或看細節走 BIOS 的 Intel RST 設定畫面_\n'
+  fi
+  if have mdadm && sudo_ready; then
+    for _md in /dev/md*; do
+      [ -b "$_md" ] || continue
+      _det="$(sudo -n mdadm --detail "$_md" 2>/dev/null |
+              grep -E 'Raid Level|Array Size|Raid Devices|Total Devices|State :|Active Devices|Working Devices|Failed Devices|Spare Devices|Rebuild Status|Consistency Policy')"
+      [ -n "$_det" ] && printf -- '- **%s**(`mdadm --detail`)\n```\n%s\n```\n' "$_md" "$_det"
+    done
+  elif ! have mdadm; then
+    note "有 md array 但沒有 mdadm 指令,成員碟明細抓不到"
+  else
+    printf -- '- _RAID level / 幾顆 / 哪一顆掉 / 重建進度要 `mdadm --detail`(需 root):加 `--with-sudo` 重跑_\n'
+  fi
 fi
 # LVM:vgs/lvs 非 root 會把警告丟到 stderr、stdout 留空,看起來像「這台沒有 LVM」。
 # 所以要分辨「真的沒有」與「沒權限」,--with-sudo 時再試一次。
+# v1.12:lvs 加 segtype —— LVM 自己也能做 RAID(raid1/raid5/mirror),預設欄位看不出來,
+# 一個 linear LV 跟一個 raid1 LV 印出來長得一樣。
 if have vgs; then
-  LVM_OUT="$(vgs 2>/dev/null; lvs 2>/dev/null)"
+  LVM_OUT="$(vgs 2>/dev/null; lvs -o +segtype 2>/dev/null)"
   if [ -z "$LVM_OUT" ] && [ "$WITH_SUDO" = "1" ]; then
-    LVM_OUT="$(sudo -n vgs 2>/dev/null; sudo -n lvs 2>/dev/null)"
+    LVM_OUT="$(sudo -n vgs 2>/dev/null; sudo -n lvs -o +segtype 2>/dev/null)"
   fi
   printf '### LVM\n'
   if [ -n "$LVM_OUT" ]; then
@@ -481,6 +709,226 @@ if have vgs; then
     note "偵測到 LVM2_member 分割,但 vgs/lvs 需要 root 才讀得到(可加 --with-sudo,或人工確認)"
   else
     printf -- '- 無 LVM\n'
+  fi
+fi
+# v1.12:ZFS / btrfs —— 軟體 RAID 的另外兩種。儲存主機不一定用 md,只查 mdstat 會漏掉整片陣列。
+# 沿用 LVM 那套「非 root 空手時要分辨『真的沒有』與『沒權限』」的做法。
+printf '### ZFS\n'
+if ! have zpool; then
+  printf -- '- 無 ZFS(沒有 `zpool` 指令)\n'
+else
+  ZP="$(zpool list 2>/dev/null)"
+  { [ -z "$ZP" ] && sudo_ready; } && ZP="$(sudo -n zpool list 2>/dev/null)"
+  if [ -z "$ZP" ]; then
+    printf -- '- 裝了 ZFS 但沒有 pool(或 `zpool` 需要 root:可加 `--with-sudo`)\n'
+  else
+    printf '```\n%s\n```\n' "$ZP"
+    # `zpool status -x` 是專門的一行式健康判定:全好時只印 "all pools are healthy",
+    # 有問題才印出哪個 pool 的哪顆碟 —— 比整份 status 更適合放進紀錄。
+    ZS="$(zpool status -x 2>/dev/null)"
+    { [ -z "$ZS" ] && sudo_ready; } && ZS="$(sudo -n zpool status -x 2>/dev/null)"
+    [ -n "$ZS" ] && printf -- '- **pool 健康**(`zpool status -x`)\n```\n%s\n```\n' "$ZS"
+  fi
+fi
+# btrfs 只在真的有 btrfs 檔案系統時才查,避免在每台機器上多印一段無關的「無」
+if lsblk -o FSTYPE 2>/dev/null | grep -q btrfs; then
+  printf '### btrfs(偵測到 btrfs 檔案系統)\n'
+  if ! have btrfs; then
+    note "有 btrfs 分割但沒有 btrfs 指令,RAID profile 抓不到"
+  else
+    BT="$(btrfs filesystem show 2>/dev/null)"
+    { [ -z "$BT" ] && sudo_ready; } && BT="$(sudo -n btrfs filesystem show 2>/dev/null)"
+    if [ -n "$BT" ]; then
+      printf '```\n%s\n```\n' "$BT"
+      printf -- '- _RAID profile(single / raid1 / raid10)要 `btrfs filesystem df <掛載點>` 逐個掛載點看,本腳本不逐點掃_\n'
+    else
+      note "btrfs filesystem show 需要 root(可加 --with-sudo)"
+    fi
+  fi
+fi
+# v1.12:硬體 RAID —— 舊版完全空白的一塊。
+# 分兩層:① 控制器型號(lspci,非 root 可讀,先回答「這台有沒有硬體 RAID」);
+#         ② 陣列狀態(只有廠商 CLI 問得到,需 root)。
+# 兩層都拿不到時**要明講量不到**,不能讓上面的「md 成員全部在線」被讀成「陣列沒問題」。
+printf '### 硬體 RAID(控制器)\n'
+# HWCTL / HW_CTL_RAID 在「實體碟總覽」之前就算好了(見那裡的註解),這裡只負責印
+if ! have lspci; then
+  note "無 lspci,控制器型號要人工查(BMC 或機器標籤)"
+elif [ -n "$HWCTL" ]; then
+  printf '```\n%s\n```\n' "$HWCTL"
+  printf -- '- _`RAID bus controller` = 硬體 RAID 卡或主機板 RAID 模式;`Serial Attached SCSI controller` 多半是純 HBA(不做 RAID,RAID 在 OS 層);`SATA controller` / `Non-Volatile memory controller` = 主機板內建,碟是直連_\n'
+  # v1.12(tph 實跑修正):這句話原本無條件印,但 tph 只有一張 NVMe 控制器、也沒有 imsm ——
+  # 照印會出現一句指向不存在的東西的說明。只有真的兩者並存時才有意義。
+  [ "$IMSM_SEEN" = "1" ] && [ "$HW_CTL_RAID" = "1" ] &&
+    printf -- '- _這台兩種並存:系統碟走主機板 RAID(見上方 md 段的 `external:imsm`),資料碟走 RAID 卡_\n'
+else
+  printf -- '- `lspci` 看不到儲存控制器(VM 的虛擬碟常是這樣)\n'
+fi
+# 廠商 CLI:這類工具幾乎都不在 PATH(裝在 /opt 底下),所以 PATH 與 /opt 常見路徑都要找
+RCLI=""
+for _c in storcli64 storcli perccli64 perccli ssacli hpssacli hpacucli arcconf sas3ircu sas2ircu tw_cli MegaCli64 MegaCli megacli; do
+  if have "$_c"; then RCLI="$_c"; break; fi
+  for _p in /opt/MegaRAID/storcli /opt/MegaRAID/perccli /opt/MegaRAID/MegaCli /opt/MegaRAID/CmdTool2 \
+            /opt/lsi/storcli /opt/dell/srvadmin/bin /usr/local/sbin /usr/local/bin /opt/hp/hpssacli/bin; do
+    [ -x "$_p/$_c" ] && { RCLI="$_p/$_c"; break; }
+  done
+  [ -n "$RCLI" ] && break
+done
+if [ -z "$RCLI" ]; then
+  # v1.12 實跑修正:demo 機沒有 RAID 卡(只有主機板 SATA + NVMe 直連),舊寫法照印
+  # 「陣列健康量不到,要走 BMC」—— 那會讓人以為有個看不到的陣列。**沒有陣列就不要說量不到**,
+  # 這跟 v1.10 印誤導性的 0.00% 是同一類錯,只是方向相反(無中生有的缺口)。
+  # 所以三種情況要講三句不同的話。判準有兩個來源:碟型號露餡(HW_RAID_HINT)或 lspci 有 RAID 卡
+  # (HW_CTL_RAID)—— 任一成立就算「有陣列但量不到」。
+  if [ "$HW_RAID_HINT" = "1" ] || [ "$HW_CTL_RAID" = "1" ]; then
+    printf -- '- **有 RAID 控制器但沒有廠商 CLI**(找過 storcli / perccli / MegaCli / ssacli / arcconf / sas3ircu / tw_cli,PATH 與 /opt 常見路徑都沒有)\n'
+    printf -- '- **所以陣列健康、有沒有 degraded、是哪一顆壞、底下幾顆碟,這台量不到** —— 這些都在控制器層,`lsblk` / `mdstat` / `df` 一律看不到。要走 **BMC(iDRAC / iLO / IPMI web)**,或請客戶裝廠商 CLI 後重跑。\n'
+  elif [ "$HW_VDISK_HINT" = "1" ]; then
+    printf -- '- 沒有廠商 CLI,**這台也不需要** —— 碟是 hypervisor 給的虛擬碟,底層 RAID 在客戶的虛擬化平台 / 儲存設備上,要問虛擬化管理者(見上方「實體碟總覽」的註記)\n'
+  else
+    printf -- '- **未偵測到 RAID 控制器**(碟是主機板 SATA / NVMe 直連),也沒有廠商 CLI —— **沒有控制器層的陣列要查**。這台的 RAID 若存在只會在 OS 層(見上方 md / ZFS / LVM 三段),碟本身的健康看下方 SMART。\n'
+  fi
+else
+  kv "廠商 CLI" "\`$RCLI\`"
+  # 每種卡的唯讀查詢指令不同。一律只用 show / display / info / GETCONFIG 這類「讀」的子指令,
+  # 不下任何 set / start / rebuild —— 正式機上這段必須是純查詢。
+  case "$(basename "$RCLI")" in
+    storcli*|perccli*)  RCLI_CMD="$RCLI /c0 show" ;;             # 一頁含 controller + VD + PD 狀態
+    MegaCli*|megacli)   RCLI_CMD="$RCLI -LDInfo -Lall -aALL" ;;  # PD 明細另有 -PDList,太長不自動跑
+    ssacli|hpssacli|hpacucli) RCLI_CMD="$RCLI ctrl all show config" ;;
+    arcconf)            RCLI_CMD="$RCLI GETCONFIG 1 LD" ;;
+    sas3ircu|sas2ircu)  RCLI_CMD="$RCLI 0 DISPLAY" ;;
+    tw_cli)             RCLI_CMD="$RCLI info" ;;
+    *)                  RCLI_CMD="" ;;
+  esac
+  if [ -z "$RCLI_CMD" ]; then
+    note "認得這支 CLI 但沒有對應的唯讀查詢指令,請人工執行"
+  elif sudo_ready; then
+    RCLI_OUT="$(sudo -n $RCLI_CMD 2>/dev/null)"
+    if [ -n "$RCLI_OUT" ]; then
+      printf -- '- 唯讀查詢:`%s`\n' "$RCLI_CMD"
+      # v1.12(ukt 實跑修正):`storcli /c0 show` 實測約 175 行,而且**最有價值的 PD LIST 在後段**
+      # —— 原本 `head -150` 正好把它切掉。而且就算全貼,要人從 175 行裡數「幾顆碟、有沒有壞」
+      # 也不合理:**這一段的存在理由就是回答那兩個問題**。
+      # 所以先解析出摘要(欄位直接對應站頁模板 C2:陣列 / RAID level / 成員碟 / 狀態),再貼原文。
+      # 只解析 storcli / perccli 的格式(其他廠商 CLI 版面不同,沒有摘要就只貼原文)。
+      case "$(basename "$RCLI")" in
+        storcli*|perccli*)
+          printf '%s\n' "$RCLI_OUT" | awk '
+            /^Product Name/     { sub(/^[^=]*= */, ""); prod = $0 }
+            /^FW Package Build/ { sub(/^[^=]*= */, ""); fw = $0 }
+            /^Virtual Drives/   { sub(/^[^=]*= */, ""); nvd = $0 }
+            /^Physical Drives/  { sub(/^[^=]*= */, ""); npd = $0 }
+            # VD LIST 資料列:`0/0   RAID6 Optl  RW  Yes  RWTD  -  ON  229.188 TB`
+            /^[0-9]+\/[0-9]+[ \t]/ {
+              vd = vd sprintf("%s %s **%s** %s %s;  ", $1, $2, $3, $9, $10)
+              if ($3 != "Optl") badvd = badvd " " $1 "(" $3 ")"
+            }
+            # PD LIST 資料列:`8:0  55 Onln  0 16.370 TB SAS HDD N N 512B ST18000NM004J U -`
+            /^[0-9]+:[0-9]+[ \t]/ {
+              pn++; st[$3]++
+              if (model == "") { model = $12; psz = $5 " " $6; intf = $7 " " $8 }
+              # Onln=在陣列中、GHS/DHS=熱備、UGood=未配置但健康;其餘(Failed/Offln/UBad/Msng/Rbld)都要點名
+              if ($3 != "Onln" && $3 != "GHS" && $3 != "DHS" && $3 != "UGood") badpd = badpd " " $1 "(" $3 ")"
+            }
+            END {
+              if (prod != "") printf "- **控制器**: %s(FW %s)\n", prod, fw
+              if (vd != "") { sub(/;  $/, "", vd); printf "- **陣列(VD)**: %s 個 —— %s\n", nvd, vd }
+              if (pn > 0) {
+                s = ""
+                for (k in st) s = s sprintf("%s %d / ", k, st[k])
+                sub(/ \/ $/, "", s)
+                printf "- **控制器後面的實體碟**: **%s 顆**(%s)—— %s %s %s\n", (npd == "" ? pn : npd), s, model, psz, intf
+                # 表頭顆數與表列行數不一致 = 輸出被截或版面不同,要讓人知道別採信其中一個
+                if (npd != "" && npd + 0 != pn)
+                  printf "- _表頭寫 %s 顆但表列只有 %d 行,不一致 —— 請人工執行上面那條指令確認_\n", npd, pn
+              }
+              if (badvd != "" || badpd != "")
+                printf "- **異常:%s%s** —— 這是要立刻處理的\n", (badvd == "" ? "" : " VD" badvd), (badpd == "" ? "" : " PD" badpd)
+              else if (vd != "" || pn > 0)
+                printf "- **異常**: 無(所有 VD 為 Optl,所有 PD 為 Onln 或熱備)\n"
+            }
+          '
+          printf -- '- _`OS 看得到的碟` 那格是 virtual disk 數,**這裡的顆數才是實體硬碟數**_\n' ;;
+      esac
+      # 原文照貼,但砍掉 legend 區塊(`DG=Disk Group Index|Arr=...` 這類說明佔了快 40 行)
+      RCLI_BODY="$(printf '%s\n' "$RCLI_OUT" |
+        grep -vE '^[A-Za-z][A-Za-z0-9 ]*=.*\|' | grep -v '^Check Consistency$' |
+        grep -v 'Generating detailed summary' | cat -s)"
+      printf '```\n%s\n```\n' "$(printf '%s\n' "$RCLI_BODY" | head -200)"
+      # 有截斷就要說(不然讀者會以為這就是全部)
+      [ "$(printf '%s\n' "$RCLI_BODY" | wc -l | tr -d ' ')" -gt 200 ] &&
+        printf -- '- _(原文過長,只留前 200 行;完整內容請在站台自行執行上面那條指令。已砍掉 legend 說明區塊)_\n'
+      printf -- '- _State 對照:VD `Optl`=正常 / `Dgrd`=缺碟 / `Pdgd`=部分降級;PD `Onln`=在陣列中 / `GHS`=全域熱備 / `UGood`=未配置 / `Failed`·`Offln`·`Msng`=要換 / `Rbld`=重建中_\n'
+    else
+      note "$RCLI 執行不到內容(可能不是這張卡的工具、或這台沒有 RAID 控制器)"
+    fi
+  else
+    # v1.12(ukt 實跑修正):要分清楚「沒加旗標」與「加了但拿不到 root」,否則使用者
+    # 看到「沒有 root」會以為是權限問題,其實只是這次沒帶 --with-sudo。
+    if [ "$WITH_SUDO" = "1" ]; then
+      printf -- '- _有 CLI 但拿不到 root(沒有免密 sudo,且沒有 tty 或腳本是從 stdin 餵入)。陣列狀態請在該機人工執行(唯讀):_\n'
+    else
+      printf -- '- _**有 CLI,但這次沒帶 `--with-sudo` 所以沒查**。加旗標重跑就會抓,或在該機人工執行(唯讀):_\n'
+    fi
+    printf '```\nsudo %s\n```\n' "$RCLI_CMD"
+  fi
+fi
+# v1.12:SMART —— **刻意只取整體健康判定那一行**。通電時數 / 重配置磁區 / NVMe 壽命% 不抓:
+# 那是持續監控的指標(要看趨勢),不是交接紀錄要的東西,而且每顆碟都倒一份會把報告淹掉。
+printf '### 硬碟健康(SMART,只取整體判定)\n'
+# v1.12(tph 實跑修正):VM 上這一段整個不適用 —— tph 是 AWS,碟是 EBS,舊寫法照印
+# 「量不到,要看就走 BMC」,但**雲端沒有 BMC**,而且虛擬碟本來就沒有 SMART 可言。
+# 這是「不要無中生有缺口」的第三個實例(前兩個:demo 機的假 RAID 缺口、tph 的假 BMC 建議)。
+IS_VM=0
+{ [ -n "$VIRT" ] && [ "$VIRT" != "none" ]; } && IS_VM=1
+if [ "$IS_VM" = "1" ]; then
+  case "$VIRT" in
+    amazon|gce|azure|oracle|alibaba)
+      printf -- '- **不適用**:這是雲端 VM(`%s`),碟是雲端的網路 block storage,**沒有實體碟的 SMART 可讀,也沒有 BMC**。底層硬碟由雲端業者負責,壞碟由他們換,我們看不到也不必看。\n' "$VIRT" ;;
+    *)
+      printf -- '- **不適用**:這是虛擬機(`%s`),碟是 hypervisor 給的虛擬碟,**guest 讀不到實體碟的 SMART**(即使裝了 smartmontools,讀到的也不是實體碟的健康)。實體碟健康要在 hypervisor / 儲存設備那一側看,要問客戶的虛擬化管理者。\n' "$VIRT" ;;
+  esac
+elif ! have smartctl; then
+  printf -- '- 無 `smartctl`(smartmontools 未安裝),**硬碟健康這台量不到**;要看就走 BMC 或請客戶裝 smartmontools\n'
+  # 碟在 RAID 控制器後面時,smartctl 本來也要靠 -d megaraid,N 才問得到,所以廠商 CLI 是更直接的路
+  [ "$HW_RAID_HINT" = "1" ] || [ "$HW_CTL_RAID" = "1" ] &&
+    printf -- '- _這台的碟在 RAID 控制器後面,即使裝了 smartmontools 也要走 `-d megaraid,N`;**用上面的廠商 CLI 看 PD 狀態更直接**_\n'
+elif ! sudo_ready; then
+  if [ "$WITH_SUDO" = "1" ]; then
+    printf -- '- 有 `smartctl` 但拿不到 root,硬碟健康略過。原因是「沒有免密 sudo」加上以下任一:沒有 tty、或**腳本是從 stdin 餵進來的**(`bash -s < 腳本` / `curl | bash` —— 那種跑法不會問密碼,因為 sudo 會跟腳本搶同一條 stdin)。要抓就把腳本落地到該機再跑:`bash 腳本 --with-sudo`\n'
+  else
+    printf -- '- 有 `smartctl`,但 SMART 需要 root:加 `--with-sudo` 重跑(會問一次密碼)\n'
+  fi
+else
+  # 裝置清單優先用 smartctl 自己的 --scan-open:RAID 控制器後面的碟要 `-d megaraid,N` 這種
+  # 語法才問得到,手寫 /dev/sdX 清單問不到。掃不出來才退回 lsblk 的實體碟清單。
+  SMDEV="$(sudo -n smartctl --scan-open 2>/dev/null | sed 's/#.*//; s/[[:space:]]*$//' | grep -v '^$')"
+  SMSRC="smartctl --scan-open"
+  if [ -z "$SMDEV" ]; then
+    SMDEV="$(printf '%s\n' "$DISKROWS" | awk 'NF{print "/dev/"$1}')"
+    SMSRC="lsblk 實體碟清單(--scan-open 沒掃到)"
+  fi
+  if [ -z "$SMDEV" ]; then
+    note "找不到可查詢的碟"
+  else
+    printf '```\n'
+    printf '%-34s %s\n' DEVICE HEALTH   # 表頭用 ASCII,理由同「實體碟總覽」那張表
+    printf '%s\n' "$SMDEV" | while IFS= read -r _d; do
+      [ -n "$_d" ] || continue
+      # $_d 可能是「/dev/bus/0 -d megaraid,8」這種多字串,要讓它自然斷字,所以刻意不加引號
+      # shellcheck disable=SC2086
+      _out="$(sudo -n smartctl -H $_d 2>&1)"
+      _res="$(printf '%s\n' "$_out" | grep -iE 'overall-health|SMART Health Status' | sed -E 's/.*: *//' | head -1)"
+      if [ -z "$_res" ]; then
+        _res="量不到($(printf '%s\n' "$_out" | grep -iE 'unable|unknown|failed|permission|not supported|Open failed' | head -1 | cut -c1-56))"
+      fi
+      printf '%-34s %s\n' "$_d" "$_res"
+    done
+    printf '```\n'
+    kv "裝置清單來源" "$SMSRC"
+    printf -- '- PASSED / OK = 這顆碟自評沒事;**FAILED = 立刻安排換碟**。「量不到」多半是碟在 RAID 控制器後面而 `--scan-open` 沒列出來 —— 走 BMC 或上面的廠商 CLI。\n'
+    printf -- '- _通電時數 / 重配置磁區 / NVMe 壽命%% 本腳本刻意不抓(屬監控指標,不是環境紀錄)_\n'
   fi
 fi
 # v1.8:上面的 mount 是「這台掛了誰的資料」,這裡是反過來「這台把資料分享給誰」。
@@ -616,8 +1064,10 @@ printf '```\n'
 if have systemctl; then
   # v1.8:白名單加 smb/nmb/winbind/nfs-server —— 這類不屬於 aetherSlide,但常常正在
   # 把 aetherSlide 的資料分享出去(ukt node-1 的 samba 就是這樣被漏掉的)。
+  # v1.12:再加 smartd/mdmonitor/zed/multipathd —— 「碟壞了有沒有人會被通知」跟「碟現在好不好」
+  # 是兩件事,交接都要知道(mdcheck_* timer 走下面的 timer 段,黑名單沒濾掉它)。
   UNITS="$(systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null \
-    | grep -iE 'docker|compose|aetherslide|website|microk8s|kubelet|containerd|smbd|nmbd|winbind|nfs-server' | awk '{print $1}')"
+    | grep -iE 'docker|compose|aetherslide|website|microk8s|kubelet|containerd|smbd|nmbd|winbind|nfs-server|smartd|mdmonitor|zed|multipathd' | awk '{print $1}')"
   printf '### 相關 systemd service\n'
   if [ -n "$UNITS" ]; then printf '```\n%s\n```\n' "$UNITS"; else printf -- '- 無(可能是人工 `bin/dc up` 起的)\n'; fi
   # 濾掉每台 Ubuntu 都有的 OS 預設 timer,只留這台自己加的
