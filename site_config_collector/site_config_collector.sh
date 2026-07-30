@@ -1,126 +1,26 @@
 #!/usr/bin/env bash
-# collect_site_config.sh v1.12 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 Obsidian
-# site config 站頁(標「腳本」的欄位)。
+# collect_site_config.sh v1.13 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 site config 站頁。
 #
-# v1.12 相對 v1.11 —— **儲存段整組加深(第 4 段),回答三個舊版答不出來的問題**:
-#   ① **幾顆碟**:新增「實體碟總覽」(`lsblk -d`:容量 / HDD-SSD / 介面 / 型號 / 序號 + 顆數統計)。
-#      舊版只有分割樹,要人自己數,也看不出型號與是不是 SSD。
-#      **顆數會說話**:MODEL 出現 `PERC` / `MegaRAID` / `LOGICAL VOLUME` / VMware 虛擬碟時多印一行
-#      「這個顆數不是實體硬碟數」—— 硬體 RAID 站台 OS 只看到 1 顆 virtual disk,底下可能是 8 顆,
-#      不標的話「硬碟總數 1」是錯的。
-#   ② **軟體 RAID 狀態**:md 段改成**一律印結論**(舊版沒有 md 時整段消失,讀者分不出
-#      「沒有軟 RAID」還是「腳本沒查」),並從 mdstat 的 `[U_]` / `(F)` / `recovery` 直接判
-#      **degraded / faulty / 重建中**(純文字判斷,不需 root)。`--with-sudo` 再補 `mdadm --detail`
-#      (RAID level / 幾顆 / State / 重建進度)。另加 ZFS(`zpool status -x`)與 btrfs 兩種軟 RAID,
-#      LVM 的 `lvs` 加 `segtype`(看得出 linear 還是 raid1/mirror)。
-#   ③ **硬體 RAID 狀態**:舊版完全空白。現在先用 `lspci` 印控制器型號(非 root 可讀),再找廠商
-#      CLI(storcli / perccli / MegaCli / ssacli / arcconf / sas3ircu / tw_cli,PATH 加 /opt 常見路徑),
-#      有 CLI 就跑**唯讀** show 指令抓 VD / PD 狀態;**都沒有就明寫「量不到,要走 BMC」** ——
-#      同 v1.10/v1.11 的原則:寧可標明量不到,也不要讓 `mdstat 正常` 被誤讀成「陣列沒問題」。
-#   ④ **SMART**:每顆碟的整體健康判定(PASSED / FAILED)。**刻意只取這一行** —— 通電時數、
-#      重配置磁區、NVMe 壽命% 不抓(那是維運監控,不是環境紀錄)。裝置清單優先用
-#      `smartctl --scan-open`,因為 RAID 控制器後面的碟要 `-d megaraid,N` 才問得到。
-#   ⑤ 第 6 段執行中 service 的白名單加 `smartd|mdmonitor|zed|multipathd` —— 有沒有人在監控 RAID
-#      跟 RAID 現在好不好是兩件事,交接都要知道。
-#   ⑥ **實跑(demo 機 + ukt 儲存主機)修掉的**:表頭一律 ASCII(中文佔兩格會跟資料列錯開,
-#      同 v1.11 的釘子);「沒有陣列」與「有陣列但量不到」要講不同的話(不能無中生有缺口);
-#      判斷 virtual disk 要連 `VENDOR` 一起看(MegaRAID 的 VD 型號是 `MRROMB`,看不出跟 RAID 有關)
-#      且警語要指名是哪幾顆;控制器偵測提前到第 4 段開頭(否則「實體碟總覽」讀不到);
-#      新增「掛載中但 lsblk 沒列」檢查(ukt 有顆 93% 滿的碟掉出 /sys/block 但掛載還在);
-#      `external:imsm` 的 `inactive` 是正常的,要多印一行解釋免得被當成故障。
-#   ⚠ **③④ 需要 root,且這兩項是「沒有它就完全量不到」的欄位**,所以與 dmidecode / LVM 的
-#     `sudo -n`(沒權限就靜默略過)不同:`--with-sudo` 時允許**互動輸入密碼**。密碼只問一次
-#     (先 `sudo -v` 取 timestamp,之後每條查詢一律 `sudo -n`),且只在有 tty 時問 ——
-#     dual node 的 SSH child 沒有 tty,會自動退回「略過並註記」,不會卡在那裡等輸入。
-#     不想給密碼就在提示時按 Ctrl-D(或連按 Enter),其餘採集完全不受影響。
-#
-# v1.11 相對 v1.10(與 v1.10 同一個教訓的第二個實例:值本身要會說話,不能只靠引言警語):
-#   **虛擬網卡的 speed 加 `*` 標記**。v1.10 的介面明細表在 ukt 兩台 vmware VM 上照印
-#   10000Mb/s,只有表格上方一句引言說那是 guest 視角 —— 跳過引言直接看表的人會誤讀成
-#   「這台有 10G」。現在 vmxnet3 / virtio_net / e1000 / hv_netvsc / xen-netfront 這些
-#   驅動的 speed 一律標星號,並在表下說明真正的上限在 hypervisor(實體 uplink、vSwitch
-#   teaming、port group 的 traffic shaping —— 這三件 guest 都看不到,只能問客戶)。
-#   判斷用驅動名而不是 VIRT:實體機不會出現這些驅動,也就不必把 VIRT 的計算提早。
-#   另外偵測到 e1000/e1000e(**模擬**卡,非半虛擬化)會多印一行提醒 —— VM 上「型號」那格
-#   唯一的實用價值就是分辨這個。
-#
-# v1.10 相對 v1.9(ukt 實跑後的修正,只動 CPU steal 一處):
-#   **VMware / Hyper-V 的 guest 量不到 CPU steal**。v1.9 在 ukt 兩台 vmware VM 上印 0.00%,
-#   看起來像「hypervisor 沒超賣」,其實是那兩家 hypervisor 根本不透過 steal time 機制回報
-#   CPU 競爭 —— 印一個看似正常的 0 比不印還糟。現在依 systemd-detect-virt 分流:
-#   vmware / microsoft 直接標「量不到」並指到 vSphere 的 CPU Ready(%RDY);
-#   kvm / xen / 雲端 VM 才照舊算 /proc/stat 的累積佔比。
-#   ⚠ 版號 V1.10 > V1.9 —— `ls` 的字典序會排錯,但 publish.sh 用的是 `sort -V`(版本排序),
-#     選版正確;說明文件的「目前最新」欄以人工標示為準。
-#
-# v1.9 相對 v1.8:補網路與儲存的「容量與健康」欄位,用途是評估**未來把 AI agent
-#   接進 aetherSlide** 時,現有環境撐不撐得住(agent 若要讀影像,每片是 GB 級,
-#   而 dual 站的資料全在 NFS 上 —— 同一張網卡收一次、送一次,是雙重計費)。
-#   ① 第 1 段:介面明細(link speed / MTU / 驅動與型號 / 累積錯誤與丟包),
-#      DOWN 的實體網卡也照列 —— 「有 10G 埠沒接線」是擴充頻寬最便宜的一條路。
-#   ② 第 1 段:bonding / VLAN。
-#   ③ 第 4 段:虛擬機的 CPU steal(自開機累積佔比,判斷 host 有沒有超賣)。
-#   ④ 第 4 段:NFS 掛載的關鍵參數(vers / proto / rsize / wsize / hard-soft / timeo)。
-#   ⑤ 第 4 段:NFS export(/etc/exports)—— 補齊 v1.8「這台把資料分享出去」只做了 samba
-#      的另一半。實測 demo 機有 /proc/fs/nfsd 才發現這個缺口。
-#   **刻意不採時點值**:即時流量水位、NFS RTT 這類上下班差很多的數字不進來
-#   (要看那些請當場跑 sar / nfsiostat)。這裡只放「開機以來就固定,或累積型」的欄位。
-#   ⚠ VM 的 link speed 是 guest 視角:vmxnet3 不管底下實體是什麼常常都報 10000Mb/s,
-#     真正的上限在 ESXi host 的 uplink 與同 host 其他 VM 的競爭,腳本問不到,要問客戶。
-#
-# v1.8 相對 v1.7:補「這台把資料分享出去」這一類 —— 站台自建、不屬於 aetherSlide、
-#   但正在服務 aetherSlide 資料的服務。起因是 ukt node-1 有客戶客製的 samba 分享
-#   /data/export 給 Windows 取檔,v1.7 兩處都漏掉它:
-#   ① 第 6 段 systemd 白名單只含 docker/compose/aetherslide/website/microk8s 等,
-#      smbd 被濾掉 → 白名單加 smb/nmb/winbind/nfs-server。
-#   ② v1.2 起不再列 listen port(當時嫌 NFS/RPC 動態高位 port 雜訊多),445 跟著消失
-#      → 不恢復 port 掃描,改在第 4 段直接讀 /etc/samba/smb.conf 列出分享名與 path。
-#
-# v1.7 相對 v1.6 只改輸出的「順序與段名」,採集邏輯完全沒動:
-#   段落順序改成與站頁一致(M-machine 各節 → GPU node → M-config 的對接),
-#   段名改成站頁的小節名,貼的時候一段對一節,不用再自己找位置。
-#   「對接與整合設定」從第 5 段移到第 8 段 —— 它讀的是 configs.env,屬 M-config 層,
-#   不是機器現況,夾在機器段中間會讓人把它貼錯區塊。
-#
-# 安全性:全程唯讀,不安裝、不修改、不需 sudo。可直接在正式機執行。
-#   (--with-sudo 例外:多跑 `dmidecode`(硬體序號)、`mdadm --detail`、廠商 RAID CLI 的 show
-#    指令、`smartctl -H`,全部是唯讀查詢,不改陣列、不觸發自我檢測。
-#    dmidecode 與 LVM 用 `sudo -n`(沒權限就靜默略過);RAID / SMART 因為「沒 root 就完全
-#    量不到」,允許互動輸入密碼 —— 只問一次、只在有 tty 時問,不想給就按 Ctrl-D 跳過。)
-# 用法:
-#   在站台上執行:  bash collect_site_config.sh [部署目錄] [--peer [user@]host] [--no-remote] [--with-sudo]
-#                                              [--ai-landing-dir 目錄]
-#   部署目錄預設 ~/website(aetherSlide)。
-#   例:bash collect_site_config.sh ~/website > site_$(hostname).md
-#
-# AI Landing(AI 推論主機):自動偵測本機有沒有 AI Landing(部署目錄 + microk8s 的
-#   ai-landing namespace),有就多出一段完整採集。GPU 常跟 aetherSlide 分開裝,
-#   分開時請「兩台各跑一次」;GPU 那台的輸出貼進站頁 M-machine 的「GPU node」段
-#   (那台的 1–7 段都要,不是只有第 7 段:OS / 磁碟 / NFS / container 都在前面幾段)。
-#   本腳本不會自動 SSH 到
-#   AI Landing 主機(兩台常屬不同網段/不同單位,免密 SSH 通常不存在)。
-#   沒偵測到就只印 aetherSlide 的 AI_LANDING_URL 並判斷它指的是不是本機。
-#   --ai-landing-dir 手動指定(自動偵測不到時用)。
-#
-# dual node:自動判定本機是 node-1 還是 node-2(比對 .env 的 NODE_1_IP/NODE_2_IP),
-#   並嘗試 SSH 到另一台跑同一份腳本,一次收齊兩台。SSH 用 BatchMode(不會問密碼),
-#   不通就跳過並提示到另一台手動執行。--peer 手動指定對方(自動判定失敗或帳號不同時用),
-#   --no-remote 只採本機。首次連線會寫入 ~/.ssh/known_hosts(唯讀例外,僅此一項)。
-#
-# 缺少的指令(nvidia-smi/docker/ss 等)會自動略過並註記,不會中斷。
+# 常態用法(零參數):
+#   bash collect.sh
+# 報告直接印在螢幕上,**不落地檔案**;起訖標記走 stderr,自己從螢幕框起來複製。
+
 
 set -u
 SELF="${BASH_SOURCE[0]:-}"
+# 第 9 段印指令時要用檔名(使用者貼進客戶機器時常改名成 collect.sh)
+SCRIPT_NAME="$(basename -- "$SELF" 2>/dev/null)"
+[ -n "$SCRIPT_NAME" ] || SCRIPT_NAME="collect.sh"
 DEPLOY_DIR=""
-DEPLOY_DIR_EXPLICIT=0
 PEER=""
-DO_REMOTE=1
-CHILD=0   # 內部用:被另一個節點透過 SSH 叫起來的那一次
-WITH_SUDO=0
 AIL_DIR=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --with-sudo) WITH_SUDO=1; shift ;;
+    # 舊文件的指令貼進來不能報錯,所以留成 no-op;印一行提示讓人知道不必再打。
+    --with-sudo)
+      printf '[collect_site_config] --with-sudo 自 v1.13 起已內建為預設,本旗標忽略。\n' >&2; shift ;;
+    --no-remote)
+      printf '[collect_site_config] --no-remote 自 v1.13 起已是預設行為(不自動連 peer),本旗標忽略。\n' >&2; shift ;;
     --ai-landing-dir)
       AIL_DIR="${2:-}"
       [ -n "$AIL_DIR" ] || { echo "--ai-landing-dir 需要目錄" >&2; exit 2; }
@@ -129,44 +29,115 @@ while [ $# -gt 0 ]; do
       PEER="${2:-}"
       [ -n "$PEER" ] || { echo "--peer 需要 [user@]host" >&2; exit 2; }
       shift 2 ;;
-    --no-remote) DO_REMOTE=0; shift ;;
-    --remote-child) CHILD=1; DO_REMOTE=0; shift ;;
     -h|--help)
-      sed -n '2,110p' "${SELF:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'
+      printf '%s v1.13 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 site config 站頁。\n\n' "$SCRIPT_NAME"
+      printf '  bash %s [部署目錄]              預設 ~/website。報告印在螢幕上,不落地檔案\n' "$SCRIPT_NAME"
+      printf '  bash %s --peer [user@]host      只印「把腳本丟到那台跑」的指令就結束,不採本機\n' "$SCRIPT_NAME"
+      printf '  bash %s --ai-landing-dir 目錄   AI Landing 自動偵測不到時指定\n\n' "$SCRIPT_NAME"
+      printf '  --with-sudo / --no-remote       v1.13 起無作用(留著讓舊文件的指令不報錯)\n\n'
+      printf '會問一次 sudo 密碼(Enter 或 10 秒不輸入 = 跳過)。用法細節、設計理由、變更歷程:見「採集腳本說明」。\n'
       exit 0 ;;
-    *) DEPLOY_DIR="$1"; DEPLOY_DIR_EXPLICIT=1; shift ;;
+    # 不認識的旗標一律報錯:舊版會被下面的 *) 當成「部署目錄」吃掉,打錯字不報錯。
+    --*)
+      printf '不認識的參數:%s\n參數表請看:bash %s -h\n' "$1" "$SCRIPT_NAME" >&2; exit 2 ;;
+    # 明確給了就一定要存在:不然報告照跑、只是第 2/5/8 段空掉,像「這站沒東西」而不是參數打錯。
+    # 不給時不檢查(GPU / 儲存主機本來就沒有 ~/website)。
+    *)
+      if [ ! -d "$1" ]; then
+        printf '參數「%s」不是一個存在的目錄。\n' "$1" >&2
+        case "$1" in
+          *@*|[0-9]*.[0-9]*.[0-9]*.[0-9]*)
+            printf '看起來像主機位址 —— 要採另一台請加 --peer:\n    bash %s --peer %s\n' "$SCRIPT_NAME" "$1" >&2 ;;
+          *)
+            printf '位置參數是 aetherSlide 的部署目錄(預設 ~/website);參數表看:bash %s -h\n' "$SCRIPT_NAME" >&2 ;;
+        esac
+        exit 2
+      fi
+      DEPLOY_DIR="$1"; shift ;;
   esac
 done
 [ -n "$DEPLOY_DIR" ] || DEPLOY_DIR="$HOME/website"
 
+# --peer 是「產生指令」模式,不採本機就結束 —— 本機資訊直接跑無參數版本就有,
+# 順便採一遍只是佔螢幕。輸出刻意只有四行(兩行註解 + ls + 那條指令)。
+if [ -n "$PEER" ]; then
+  printf '# 先確認這台有哪把金鑰(每站不一樣)\n'
+  printf 'ls -1 ~/.ssh/id_*\n\n'
+  printf '# 把 K= 換成上面查到的,整行貼上;-t 不能拿掉(沒有 pty 那台問不到 sudo 密碼)\n'
+  printf 'K=~/.ssh/id_rsa; P=%s; ssh -i $K $P '\''cat > /tmp/c.sh'\'' < %s && ssh -i $K -t $P '\''bash /tmp/c.sh; rm -f /tmp/c.sh'\''\n' \
+    "$PEER" "$SCRIPT_NAME"
+  exit 0
+fi
+
 have() { command -v "$1" >/dev/null 2>&1; }
-# v1.12:RAID 控制器狀態與 SMART 沒有 root 就完全量不到(不像序號還能看機器標籤),
-# 所以這兩項允許互動輸入密碼。設計上要避免兩件事:
-#   ① 問很多次 —— 先用 `sudo -v` 取得 timestamp,取到之後每條查詢都走 `sudo -n`(不會再問)。
-#   ② 在沒有 tty 的環境卡住等輸入 —— dual node 的 SSH child(`ssh host bash -s`,沒有 -t)
-#      就是這種情況。沒 tty 直接判定不可用,退回「略過並註記」。
-#   ③ **腳本本身是從 stdin 餵進來時,絕對不能問密碼**(`bash -s < script` / `curl | bash`)。
-#      那種跑法 stdin 就是腳本內容,sudo 讀 /dev/tty 會跟腳本搶同一條管線 —— 有人硬加
-#      `ssh -tt` 的話,sudo 會把腳本剩下的位元組當成密碼吃掉。判準用 `$SELF`:
-#      它有值且讀得到 = 腳本來自真實檔案,stdin 沒有被佔用。(2026-07-29 實跑時發現:
-#      `ssh -t host 'bash -s' < script` 連 pty 都拿不到,ssh 會直接說 stdin 不是終端機。)
-#   密碼提示與說明一律走 stderr,stdout 只有報告本文(使用者常 `> site.md`)。
-SUDO_OK=-1   # -1=還沒試 0=不可用 1=可用
-sudo_ready() {
-  [ "$WITH_SUDO" = "1" ] || return 1
-  have sudo || return 1
-  if [ "$SUDO_OK" = "-1" ]; then
-    if sudo -n true 2>/dev/null; then
-      SUDO_OK=1
-    elif [ -t 2 ] && [ "$CHILD" = "0" ] && [ -n "$SELF" ] && [ -r "$SELF" ]; then
-      printf '\n[collect_site_config] 需要 sudo 才能讀 RAID 控制器與 SMART 狀態(唯讀查詢,不改任何設定)。\n' >&2
-      printf '[collect_site_config] 密碼只問這一次;不想給就按 Ctrl-D 跳過,其餘採集不受影響。\n' >&2
-      if sudo -v; then SUDO_OK=1; else SUDO_OK=0; printf '[collect_site_config] 略過需要 root 的 RAID / SMART 欄位。\n' >&2; fi
-    else
-      SUDO_OK=0
-    fi
+# ── sudo(v1.13 內建為預設)──────
+# 提示在任何報告輸出之前問完(報告不落地,晚問會被往上洗掉),且一律走 stderr。
+SUDO_OK=0      # 1=可用
+SUDO_MODE=""   # n=走 sudo -n(timestamp 有效) / S=每次餵密碼 / ""=不可用
+SUDO_PW=""     # 只有 SUDO_MODE=S 才會留值
+SUDO_NOTE=""   # 給報告用的一句話:這次到底拿不拿得到 root、為什麼
+sudo_init() {
+  if ! have sudo; then SUDO_NOTE="本機沒有 sudo 指令"; return; fi
+  if sudo -n true 2>/dev/null; then
+    SUDO_OK=1; SUDO_MODE="n"; SUDO_NOTE="有免密 sudo(沒有問密碼)"; return
   fi
-  [ "$SUDO_OK" = "1" ]
+  # sudo 訊息受 locale 影響,中英文關鍵字都比對;比對不到保守當作「不准」,不白問。
+  _why="$(sudo -n true 2>&1)"
+  if ! printf '%s' "$_why" | grep -qiE 'password|密[碼码]'; then
+    SUDO_NOTE="這個帳號不被允許 sudo($(printf '%s' "$_why" | head -1 | cut -c1-60)),需要 root 的欄位一律略過"
+    return
+  fi
+  # ②③ 不能互動就不要問
+  if [ ! -t 2 ] || [ -z "$SELF" ] || [ ! -r "$SELF" ]; then
+    SUDO_NOTE="沒有免密 sudo,且無法互動輸入密碼(沒有 tty,或腳本是從 stdin 餵入)—— 需要 root 的欄位略過。要抓就把腳本落地到該機再跑:bash $SCRIPT_NAME"
+    return
+  fi
+  printf '\n[collect_site_config] 需要 sudo 才讀得到:硬體序號 / 保固、RAID 陣列狀態、SMART 硬碟健康、LVM。\n' >&2
+  printf '[collect_site_config] 全部是唯讀查詢,不改任何設定、不寫任何檔案。\n' >&2
+  printf '[collect_site_config] 直接按 Enter(或 10 秒不輸入)= 跳過,其餘採集完全不受影響;密碼錯誤可再試兩次。\n' >&2
+  _try=1
+  while [ "$_try" -le 3 ]; do
+    printf '[collect_site_config] sudo 密碼(第 %d/3 次,Enter 跳過): ' "$_try" >&2
+    if ! IFS= read -r -s -t 10 _pw < /dev/tty 2>/dev/null; then
+      printf '\n[collect_site_config] 逾時或輸入結束 —— 略過需要 root 的欄位。\n' >&2
+      SUDO_NOTE="沒有免密 sudo,使用者未提供密碼(逾時或按 Ctrl-D)—— 需要 root 的欄位略過"
+      return
+    fi
+    printf '\n' >&2
+    if [ -z "$_pw" ]; then
+      printf '[collect_site_config] 跳過需要 root 的欄位。\n' >&2
+      SUDO_NOTE="沒有免密 sudo,使用者選擇跳過(未輸入密碼)—— 需要 root 的欄位略過"
+      return
+    fi
+    if printf '%s\n' "$_pw" | sudo -S -p '' -v 2>/dev/null; then
+      SUDO_OK=1
+      # timestamp 到底有沒有生效?生效就把密碼丟掉,不生效才留著(見①)
+      if sudo -n true 2>/dev/null; then
+        SUDO_MODE="n"
+        SUDO_NOTE="互動輸入密碼一次(sudo timestamp 有效,腳本未保留密碼)"
+      else
+        SUDO_MODE="S"; SUDO_PW="$_pw"
+        SUDO_NOTE="互動輸入密碼一次;**本站 sudo 不快取 timestamp(timestamp_timeout=0)**,腳本執行期間全程持有密碼以免反覆詢問"
+      fi
+      unset _pw
+      printf '[collect_site_config] sudo 可用,開始採集。\n' >&2
+      return
+    fi
+    printf '[collect_site_config] 密碼錯誤。\n' >&2
+    _try=$((_try + 1))
+  done
+  unset _pw
+  SUDO_NOTE="沒有免密 sudo,密碼連續錯三次 —— 需要 root 的欄位略過"
+  printf '[collect_site_config] 三次都不對,略過需要 root 的欄位。\n' >&2
+}
+sudo_ready() { [ "$SUDO_OK" = "1" ]; }
+# 唯讀查詢統一入口。刻意不吞 stderr(SMART 段要靠 stderr 判斷「量不到」的原因)。
+sq() {
+  case "$SUDO_MODE" in
+    n) sudo -n "$@" ;;
+    S) printf '%s\n' "$SUDO_PW" | sudo -S -p '' "$@" ;;
+    *) return 1 ;;
+  esac
 }
 sec()  { printf '\n## %s\n\n' "$1"; }
 kv()   { printf -- '- **%s**: %s\n' "$1" "$2"; }
@@ -177,8 +148,7 @@ envval() {
   grep -E "^[[:space:]]*$2=" "$1" 2>/dev/null | tail -1 |
     sed -E "s/^[[:space:]]*$2=//" | tr -d "\"'" | tr -d '\r'
 }
-# values.yaml 同樣逐鍵取值(不整檔倒出,密碼類鍵不會被查)。$2 是含縮排錨點的 grep 規則,
-# 因為同一個鍵名可能在不同層出現(例如 top-level 的 port 與 grafana service 的 port)。
+# values.yaml 逐鍵取值。$2 要含縮排錨點:同一個鍵名可能在不同層出現。
 yamlval() {
   [ -f "$1" ] || return 0
   grep -E "$2" "$1" 2>/dev/null | head -1 |
@@ -186,7 +156,10 @@ yamlval() {
     tr -d "\"'" | tr -d '\r'
 }
 
-# ── 0. 節點識別 ──────────────────────────────
+# sudo 一定要在任何 stdout 輸出之前問完(見 sudo_init 的註解)
+sudo_init
+
+# ── 0. 節點識別 ──────
 # ARCHITECTURE 在 configs.env;NODE_1_IP/NODE_2_IP/VIRTUAL_IP/ES_HOST 在 .env
 ARCH="$(envval "$DEPLOY_DIR/configs.env" ARCHITECTURE)"
 NODE_1_IP="$(envval "$DEPLOY_DIR/.env" NODE_1_IP)"
@@ -207,14 +180,12 @@ elif [ -n "$ARCH" ]; then
 elif [ -f "$DEPLOY_DIR/configs.env" ]; then
   NODE_SELF="未知(configs.env 沒有 ARCHITECTURE)"
 else
-  # v1.6:純 AI Landing 主機本來就沒有 configs.env,舊版會在標題印「讀不到 configs.env」,
-  # 看起來像 aetherSlide 壞了,其實是這台根本沒裝
+  # 純 AI Landing 主機本來就沒有 configs.env,不能印成「aetherSlide 壞了」
   NODE_SELF="非 aetherSlide 主機"
 fi
 
-# ── AI Landing(AI 推論主機)偵測 ──────────────
-# GPU 常跟 aetherSlide 分開裝,所以「本機有沒有 aetherSlide」與「本機有沒有 AI Landing」
-# 是兩個獨立的問題,要各自判,不能假設同一台。
+# ── AI Landing(AI 推論主機)偵測 ──────
+# 「有 aetherSlide」與「有 AI Landing」是兩個獨立問題(GPU 常分開裝),各自判。
 HAS_AS=0
 { [ -f "$DEPLOY_DIR/configs.env" ] || [ -f "$DEPLOY_DIR/.env" ]; } && HAS_AS=1
 if [ -z "$AIL_DIR" ]; then
@@ -222,9 +193,7 @@ if [ -z "$AIL_DIR" ]; then
     [ -f "$_d/values.yaml" ] && { AIL_DIR="$_d"; break; }
   done
 fi
-# k8s 指令:microk8s 優先(AI Landing 的官方裝法),退回原生 kubectl。
-# 判準用「真的問得到 namespace」而不是 command -v —— 指令在但沒權限或叢集沒起,
-# 後面每一條查詢都會空手而回,不如一開始就分清楚。
+# k8s 指令:microk8s 優先,退回原生 kubectl。判準是「真的問得到 namespace」而非 command -v。
 KCTL=""
 if have microk8s && microk8s kubectl get ns >/dev/null 2>&1; then KCTL="microk8s kubectl"
 elif have kubectl && kubectl get ns >/dev/null 2>&1; then KCTL="kubectl"; fi
@@ -233,8 +202,7 @@ HELM=""
 if have microk8s && microk8s helm version >/dev/null 2>&1; then HELM="microk8s helm"
 elif have helm; then HELM="helm"; fi
 
-# v1.7:AI_LANDING_URL 提早在這裡算。原本寫在「對接與整合設定」那段裡,
-# 那段移到 AI Landing 之後,不提早算的話 AI Landing 段會讀不到、定位不了推論主機。
+# AI_LANDING_URL 提早算:AI Landing 段在「對接」段之前,不提早算會讀不到、定位不了推論主機。
 AIL_URL="$(envval "$DEPLOY_DIR/configs.env" AI_LANDING_URL)"
 AIL_NS="$(yamlval "$AIL_DIR/values.yaml" '^[[:space:]]+namespace:')"
 [ -n "$AIL_NS" ] || AIL_NS="ai-landing"
@@ -249,8 +217,12 @@ elif [ "$HAS_AS" = "1" ];                         then ROLE="aetherSlide(本機�
 else                                                   ROLE="兩者都沒偵測到"
 fi
 
+# 報告不落地靠螢幕複製,所以要起訖標記;走 stderr 才不會混進 stdout。
+printf '\n===== 以下開始複製(到「以上結束複製」為止)=====\n\n' >&2
+
 printf '# site config 採集結果 — %s(%s)\n' "$(hostname 2>/dev/null || echo unknown)" "$NODE_SELF"
 printf '> 唯讀採集。敏感值(帳密/私鑰)本腳本刻意不抓。\n'
+printf '> 採集權限:%s\n' "${SUDO_NOTE:-未判定}"
 printf '>\n'
 printf '> **貼到哪**(段落順序已與站頁一致,由上而下對著貼):\n'
 printf '>\n'
@@ -260,7 +232,7 @@ printf '> | 0 節點識別 | 不直接貼,用來確認架構與本機是哪一�
 printf '> | 1–6 | `AUTO:M-machine` 的同名小節 |\n'
 printf '> | 7 GPU node / AI Landing | `AUTO:M-machine` 末段「GPU node」 |\n'
 printf '> | 8 對接與整合設定 | `AUTO:M-config` 的「對接(整合)」 |\n'
-printf '> | 9 另一個節點 | 併進 M-machine 各表的 Node 2 欄 |\n'
+printf '> | 9 另一個節點 | 不直接貼:只是提醒對方節點是誰,那台自己跑一次的輸出才併進各表的 Node 2 欄 |\n'
 
 sec "0. 節點識別"
 kv "hostname" "$(hostname 2>/dev/null || echo unknown)"
@@ -281,7 +253,7 @@ if [ "$ARCH" = "dual" ]; then
     printf -- '- _NODE_1_IP/NODE_2_IP 都不在本機介面上,可能是 .env 未填或走 NAT;請人工確認_\n'
 fi
 
-# ── 1. 節點與網路 ──────────────────────────────
+# ── 1. 節點與網路 ──────
 sec "1. 節點與網路"
 # 自動判斷最可能的對外路徑:預設路由的介面就是主要對外網卡,不列整張路由表
 if have ip; then
@@ -295,13 +267,8 @@ if have ip; then
 else
   note "無 ip 指令"
 fi
-# 介面過濾(v1.4):純黑名單擋不住沒列到的名字(k8s 的 cali*、kernel 的 ip_vti0…),
-# 純白名單又會誤殺 br0 / bond0 / vlan 這些沒有實體裝置的主介面。所以用兩層:
-#   第一層(正向):留下「有實體裝置」或「有 IPv4」的 —— veth pair、cali*、ip_vti0
-#                  兩者皆非,不必知道名字就會被擋掉;DOWN 但存在的實體網卡會留著
-#                  (「有第二張網卡沒接線」是交接時要知道的事)。
-#   第二層(反向):再擋掉「有 IP 但屬於容器 / 虛擬化橋接」的那一小類。
-# v1.9:同一份過濾結果先存起來,下面「介面明細」重用,不重跑一次過濾。
+# 兩層:① 留「有實體裝置或有 IPv4」的(不必知道名字就擋掉 veth / cali*;DOWN 的實體卡留著);
+# ② 再擋有 IP 但屬容器 / 虛擬化橋接的。結果存起來給下面「介面明細」重用。
 IFLIST=""
 for _if in /sys/class/net/*; do
   _n="$(basename "$_if")"
@@ -320,12 +287,8 @@ if have ip; then
   for _n in $IFLIST; do ip -brief addr show "$_n" 2>/dev/null; done
 fi
 printf '```\n'
-# v1.9:介面明細。撈的是「開機以來就固定 or 累積型」的欄位,不撈即時流量
-# (那種上下班差很多,採集當下的值沒有代表性)。用途:評估未來 AI agent 接進來時
-# 頻寬夠不夠 —— dual 站資料全在 NFS,影像進到 image-server 走一次網路、
-# 送給瀏覽器再走一次,同一張卡雙重計費。
-# speed / MTU 都讀 sysfs 不用 ethtool:ethtool 讀 speed 要 CAP_NET_ADMIN,sysfs 不用。
-# 型號用 lspci 補,只有驅動名(vmxnet3 / i40e)看不出是 1G 還是 25G 卡。
+# 只撈累積型欄位,不撈即時流量。speed / MTU 讀 sysfs(ethtool 要 CAP_NET_ADMIN),
+# 型號用 lspci 補 —— 只有驅動名看不出是 1G 還是 25G 卡。
 printf '### 介面明細(speed / MTU / 驅動 / 型號)\n'
 printf -- '> `br0` / `bond0` 這類虛擬介面的 speed 是聚合出來的虛擬值(實測 demo 機 `br0` 報 10000Mb/s,\n'
 printf -- '> 底下的實體卡其實只跑 1000Mb/s)。**要看實體那一列,不要看 bridge 那一列。**\n'
@@ -342,9 +305,8 @@ for _n in $IFLIST; do
   case "$_sp" in ''|-1|*[!0-9-]*) _sp='-' ;; *) _sp="${_sp}Mb/s" ;; esac
   _drv="$(basename "$(readlink -f "/sys/class/net/$_n/device/driver" 2>/dev/null)" 2>/dev/null)"
   [ -n "$_drv" ] && [ "$_drv" != "." ] || _drv='-'
-  # v1.11:虛擬網卡的 speed 是 hypervisor 給的固定值,與實體上限無關 —— 加 * 標記。
-  # 用驅動名判斷就夠,不必先算 VIRT:實體機不會出現 vmxnet3 / virtio_net 這些驅動。
-  # 星號而不是「(虛擬值)」是為了不破壞欄位對齊(中文在等寬字型佔兩格,printf 按字元數算)。
+  # 虛擬網卡的 speed 是 hypervisor 給的固定值,與實體上限無關 → 加 * 標記(用驅動名判斷就夠)。
+  # 用星號而不是「(虛擬值)」:中文佔兩格會破壞 printf 的欄位對齊。
   case "$_drv" in
     vmxnet3|virtio_net|e1000|e1000e|hv_netvsc|xen-netfront)
       VIRTNIC_SEEN=1
@@ -375,9 +337,7 @@ if [ "$EMULATED_NIC_SEEN" = "1" ]; then
   printf -- '> ⚠ 偵測到 **e1000 / e1000e** —— 那是**模擬**的 Intel 千兆卡,不是半虛擬化網卡\n'
   printf -- '> (vmxnet3 / virtio_net)。吞吐與 CPU 開銷都明顯較差,通常是建 VM 時範本沒改或沒裝 VMware Tools。\n'
 fi
-# MTU 1500 vs 9000(jumbo frame)對 NFS 大檔讀取差很多,所以上面那張表要連 MTU 一起看。
-# DOWN 的實體網卡不濾掉:「有第二張 10G/25G 埠沒接線」是擴充頻寬最便宜的一條路
-# (ukt 的 GPU node 就有 6 張 DOWN 的實體網卡)。
+# MTU 1500 vs 9000 對 NFS 大檔差很多。DOWN 的實體網卡不濾掉:「有 10G 埠沒接線」是擴充頻寬最便宜的路。
 printf '### 介面累積錯誤 / 丟包(自開機累積,非時點值)\n'
 printf -- '> **`rx_drop` 在 bridge 與實體卡上常態就有數字**(收到不是給本機的封包也算),\n'
 printf -- '> 實測 demo 機 `br0` 有 300 萬筆。**要看的是 `rx_err`/`tx_err`,那才代表線路或卡有問題。**\n'
@@ -411,27 +371,48 @@ fi
 printf '### DNS\n```\n'
 grep -E '^nameserver' /etc/resolv.conf 2>/dev/null || note "讀不到 resolv.conf"
 printf '```\n'
-# v1.2 起不再列 listen port:實測抓到的幾乎都是 NFS/RPC 動態高位 port 與跳板服務,
-# 對交接沒幫助,反而要人去分辨雜訊。對外開放哪些 port 以防火牆規則為準,人工填。
+# v1.2 起不列 listen port:抓到的幾乎都是 NFS/RPC 動態高位 port,是雜訊。對外 port 以防火牆為準。
 
 # ── 2. 憑證 ──
 sec "2. 憑證(SSL)"
 CERT="$DEPLOY_DIR/data/ssl/cert.pem"
+# 「檔案不存在」與「存在但讀不到」要講不同的話:cert 常是 0600 root:root,`[ -f ]` 過得了但
+# openssl 讀不到 —— 舊版兩種都印「找不到」,權限問題會偽裝成「這站沒有憑證」。
+CERT_READ=""   # direct=一般權限可讀 / sudo=要 root / 空=讀不到
 if [ -f "$CERT" ] && have openssl; then
-  kv "憑證檔" "$CERT"
-  kv "Subject" "$(openssl x509 -in "$CERT" -noout -subject 2>/dev/null | sed 's/^subject=//')"
-  kv "SAN" "$(openssl x509 -in "$CERT" -noout -ext subjectAltName 2>/dev/null | grep -v 'X509v3' | tr -s ' ')"
-  kv "到期" "$(openssl x509 -in "$CERT" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+  if openssl x509 -in "$CERT" -noout -subject >/dev/null 2>&1; then
+    CERT_READ="direct"
+  elif sudo_ready && sq openssl x509 -in "$CERT" -noout -subject >/dev/null 2>&1; then
+    CERT_READ="sudo"
+  fi
+fi
+cert_x509() {
+  if [ "$CERT_READ" = "sudo" ]; then sq openssl x509 -in "$CERT" -noout "$@" 2>/dev/null
+  else openssl x509 -in "$CERT" -noout "$@" 2>/dev/null; fi
+}
+if [ -n "$CERT_READ" ]; then
+  kv "憑證檔" "$CERT$([ "$CERT_READ" = "sudo" ] && printf '(檔案權限只有 root 可讀,用 sudo 讀取)')"
+  kv "Subject" "$(cert_x509 -subject | sed 's/^subject=//')"
+  kv "SAN" "$(cert_x509 -ext subjectAltName | grep -v 'X509v3' | tr -s ' ')"
+  kv "到期" "$(cert_x509 -enddate | sed 's/^notAfter=//')"
+elif [ -f "$CERT" ] && have openssl; then
+  # 檔案在、openssl 也在,但讀不到 —— 這是權限,不是「沒有憑證」
+  kv "憑證檔" "$CERT(**檔案存在但讀不到**)"
+  printf -- '- _`openssl x509` 讀取失敗,幾乎一定是檔案權限(cert/key 常設成 `0600 root:root`)。**這不代表這站沒有憑證。**_\n'
+  printf -- '- _本次 sudo 狀態:%s。要補這幾格就在該機用 root 執行(唯讀):_\n' "${SUDO_NOTE:-未判定}"
+  printf '```\nsudo openssl x509 -in %s -noout -subject -ext subjectAltName -enddate\n```\n' "$CERT"
+elif [ -f "$CERT" ]; then
+  note "有 $CERT 但本機沒有 openssl 指令,憑證細節抓不到"
 elif printf '%s' "$(envval "$DEPLOY_DIR/configs.env" MODULES)" | grep -q caddy ||
      { have docker && docker ps --format '{{.Names}}' 2>/dev/null | grep -q caddy; }; then
   # 啟用 caddy 的站台憑證由 caddy 自己申請與續約,不會放在 data/ssl
   kv "憑證管理方式" "caddy(ACME 自動申請 / 續約),不在 $DEPLOY_DIR/data/ssl"
   note "憑證細節要進 caddy 容器或看 caddy 資料目錄,本腳本不進容器"
 else
-  note "找不到 $CERT 或無 openssl(非標準路徑請自行指定)"
+  note "$CERT 不存在(檔案真的沒有,不是權限問題),也沒偵測到 caddy —— 非標準路徑請用部署目錄參數指定,或問客戶憑證放哪"
 fi
 
-# ── 3. 硬體 ──────────────────────────────
+# ── 3. 硬體 ──────
 sec "3. 硬體"
 if have lscpu; then
   kv "CPU 型號" "$(lscpu 2>/dev/null | grep -E 'Model name' | sed 's/.*: *//')"
@@ -446,35 +427,31 @@ if have nvidia-smi; then
   nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || nvidia-smi -L 2>/dev/null
 else note "無 nvidia-smi"; fi
 printf '```\n'
-# 序號/保固要靠 dmidecode(需 sudo),預設不跑;--with-sudo 才試,且用 sudo -n 不問密碼
-if [ "$WITH_SUDO" = "1" ] && have dmidecode; then
-  SERIAL="$(sudo -n dmidecode -s system-serial-number 2>/dev/null | grep -v '^#' | head -1)"
-  PRODUCT="$(sudo -n dmidecode -s system-product-name 2>/dev/null | grep -v '^#' | head -1)"
-  VENDOR="$(sudo -n dmidecode -s system-manufacturer 2>/dev/null | grep -v '^#' | head -1)"
+# 序號 / 保固靠 dmidecode(需 root)。序號是查保固的唯一線索,拿到權限就抓。
+if ! have dmidecode; then
+  printf -- '_序號 / 保固 / 供應商:本機沒有 `dmidecode` 指令,要看機器標籤或 BMC_\n'
+elif sudo_ready; then
+  SERIAL="$(sq dmidecode -s system-serial-number 2>/dev/null | grep -v '^#' | head -1)"
+  PRODUCT="$(sq dmidecode -s system-product-name 2>/dev/null | grep -v '^#' | head -1)"
+  VENDOR="$(sq dmidecode -s system-manufacturer 2>/dev/null | grep -v '^#' | head -1)"
   if [ -n "$SERIAL$PRODUCT$VENDOR" ]; then
     kv "廠牌 / 型號" "${VENDOR:-未知} / ${PRODUCT:-未知}"
     kv "系統序號" "${SERIAL:-未知}"
   else
-    note "--with-sudo 但沒有免密 sudo 權限,序號仍需人工查"
+    note "有 sudo 也有 dmidecode,但問不到序號(VM 常常如此:虛擬機沒有實體 DMI 資料)"
   fi
 else
-  printf -- '_序號 / 保固 / 供應商需另查(需 sudo;有免密 sudo 時可加 `--with-sudo` 讓腳本抓)_\n'
+  printf -- '_序號 / 保固 / 供應商需另查(需 root:%s)_\n' "${SUDO_NOTE:-未判定}"
 fi
 
-# ── 4. OS / Docker / 儲存 ──────────────────────────────
+# ── 4. OS / Docker / 儲存 ──────
 sec "4. OS / Docker / 儲存"
 kv "OS" "$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
 kv "Kernel" "$(uname -r 2>/dev/null)"
 VIRT=""
 if have systemd-detect-virt; then VIRT="$(systemd-detect-virt 2>/dev/null)"; kv "虛擬化" "$VIRT"; fi
-# CPU steal —— 只在 VM 上有意義(實體機恆為 0)。用 /proc/stat 的累積值算佔比,
-# 不用 `vmstat 1 2` 的一秒取樣:那是時點值,上下班差很多。這裡是自開機以來的平均,
-# 持續偏高代表 hypervisor 上被別的 VM 卡住 —— 加 vCPU 也救不了,要找客戶的虛擬化管理者。
-#
-# v1.10:**但這只在會回報 steal time 的 hypervisor 上成立**。VMware / Hyper-V 不透過
-# steal time 機制暴露 CPU 競爭,guest 的 /proc/stat steal 幾乎恆為 0 —— v1.9 在 ukt 兩台
-# vmware VM 上就印出 0.00%,看起來像「沒被超賣」,其實是「量不到」。**印一個看似正常的 0
-# 比不印還糟**,所以這類 hypervisor 直接標明量不到,並指到該去看哪個指標。
+# **VMware / Hyper-V 不透過 steal time 暴露 CPU 競爭**,guest 恆為 0 ——
+# 印一個看似正常的 0 比不印還糟,所以這兩家直接標「量不到」。
 if [ -n "$VIRT" ] && [ "$VIRT" != "none" ] && [ -r /proc/stat ]; then
   case "$VIRT" in
     vmware)
@@ -487,17 +464,14 @@ if [ -n "$VIRT" ] && [ "$VIRT" != "none" ] && [ -r /proc/stat ]; then
   esac
 fi
 if have docker; then kv "Docker" "$(docker --version 2>/dev/null)"; else note "無 docker"; fi
-# v1.12(ukt 實跑修正):儲存控制器的偵測要**提早在這裡**算,不能等到下面的「硬體 RAID」段 ——
-# 「實體碟總覽」需要它來判斷顆數可不可信。同 v1.7 那個教訓:值算太晚,前面的段就讀不到。
+# 控制器偵測要提早在這裡算:「實體碟總覽」需要它判斷顆數可不可信。
 HWCTL=""
 have lspci && HWCTL="$(lspci 2>/dev/null | grep -iE 'RAID bus controller|Serial Attached SCSI controller|Mass storage controller|SATA controller|Non-Volatile memory controller')"
 HW_CTL_RAID=0
 printf '%s\n' "$HWCTL" | grep -qi 'RAID bus controller' && HW_CTL_RAID=1
 IMSM_SEEN=0   # 下面 md 段偵測到 Intel RST 時設 1;硬體 RAID 段要用(md 段在它前面)
-# v1.12:先回答「這台幾顆碟」。舊版只有下面的分割樹,要人自己數,而且看不出容量以外的事
-# (是 SSD 還是 HDD、什麼介面、什麼型號)。
-# 用 `-P`(key="value")而不是欄位對齊格式:MODEL 常含空白(`PERC H730P Mini`),
-# 用欄位切割會被切成兩欄,序號跟著跑位。
+# 先回答「這台幾顆碟」。用 -P(key="value")而不是欄位對齊:MODEL 常含空白(PERC H730P Mini),
+# 欄位切割會把它切成兩欄、序號跟著跑位。
 printf '### 實體碟總覽\n'
 DISKROWS=""
 # 這兩個旗標會傳到下面的「硬體 RAID」段用:碟的型號本身就是「這台的碟是誰做出來的」的線索。
@@ -506,9 +480,8 @@ HW_VDISK_HINT=0   # 型號看起來是 hypervisor 給的虛擬碟
 VDRAID=""         # 命中前者的裝置名(空白分隔)
 VDVIRT=""         # 命中後者的裝置名
 if have lsblk; then
-  # VENDOR 一起抓:ukt 實跑證明**只看 MODEL 不夠** —— MegaRAID 做出來的 VD 型號是 `MRROMB`
-  # (MegaRAID ROMB),字面上完全看不出跟 RAID 有關,但 VENDOR 會是 AVAGO / LSI / DELL。
-  # VENDOR 不進表(表已經 6 欄),只用來判斷這一列是不是 virtual disk。
+  # VENDOR 一起抓:只看 MODEL 不夠 —— MegaRAID 的 VD 型號是 MRROMB,字面看不出跟 RAID 有關,
+  # 但 VENDOR 會是 AVAGO / LSI / DELL。VENDOR 不進表,只用來判斷是不是 virtual disk。
   DISKRAW="$(lsblk -dn -P -e 7,11 -o NAME,SIZE,ROTA,TRAN,TYPE,VENDOR,MODEL,SERIAL 2>/dev/null | awk '
     function g(s, k,   r) {
       r = ""
@@ -523,8 +496,7 @@ if have lsblk; then
       kind = (rota == "1" ? "HDD" : (rota == "0" ? "SSD/NVMe" : "?"))
       if (kind == "HDD") hdd++; else if (kind == "SSD/NVMe") ssd++; else unk++
       n++
-      # 廠牌 + 型號一起比對,並把命中的裝置名收起來 —— 警語要能指名道姓說「哪幾列」,
-      # 只說「有一列是 VD」讀者還是得自己猜。
+      # 廠牌+型號一起比對,並收集命中的裝置名 —— 警語要能指名是哪幾列。
       vm = vend " " model
       if (vm ~ /(PERC|MegaRAID|MRROMB|MR9|LSI|AVAGO|Broadcom|ServeRAID|Smart Array|Adaptec|LOGICAL VOLUME)/) vdr = vdr " " name
       if (vm ~ /(VMware|Virtual disk|Virtual HD|QEMU HARDDISK|VBOX|Msft)/) vdv = vdv " " name
@@ -544,23 +516,17 @@ if have lsblk; then
   kv "OS 看得到的碟" "$(printf '%s' "$DCOUNT" | awk '{print $1" 顆(HDD "$2" / SSD-NVMe "$3" / 未知 "$4")"}')"
   if [ -n "$DISKROWS" ]; then
     printf '```\n'
-    # 表頭用 ASCII:中文在等寬字型佔兩格,`printf %-Ns` 按字元數算,用「類型 / 介面」當表頭
-    # 會讓表頭與資料列對不齊(v1.11 已經在網卡那張表踩過同一顆釘子,那次的解法是改用 `*`)。
+    # 表頭用 ASCII:中文佔兩格但 printf %-Ns 按字元數算,中文表頭會與資料列對不齊。
     printf '%-12s %-8s %-9s %-6s %-30s %s\n' NAME SIZE HDD/SSD BUS MODEL SERIAL
     printf '%s\n' "$DISKROWS"
     printf '```\n'
   fi
-  # 值本身要會說話(同 v1.10/v1.11):硬體 RAID 站台的 OS 只看到控制器做出來的 virtual disk,
-  # 底下幾十顆碟在 lsblk 一律看不到 —— 不標的話這個顆數是錯的答案。
-  # 分成「控制器做的」與「hypervisor 做的」兩種,因為要去問的人不同:前者走 BMC / 廠商 CLI,
-  # 後者只能問客戶的虛擬化管理者(BMC 也看不到 guest 的虛擬碟底下是什麼)。
+  # 硬體 RAID 站台的 OS 只看到 virtual disk,底下幾十顆碟 lsblk 看不到 —— 不標這個顆數是錯的。
+  # 分「控制器做的」與「hypervisor 做的」兩種:要問的人不同(BMC / 廠商 CLI vs 虛擬化管理者)。
   [ -n "$VDRAID" ] && HW_RAID_HINT=1
   [ -n "$VDVIRT" ] && HW_VDISK_HINT=1
-  # v1.12(tph 實跑修正):**型號比對抓不完虛擬碟**。tph 是 AWS,型號是
-  # `Amazon Elastic Block Store`(EBS,網路連接的 block storage),不在任何比對清單裡,
-  # 所以照印「1 顆」而沒有任何標注 —— 跟 ukt 的 `MRROMB` 是同一個錯,只是換成雲端。
-  # 各家雲與虛擬化平台的碟型號列不完(`Google PersistentDisk`、`Virtual disk`、`QEMU`…),
-  # 所以主判準改用 **systemd-detect-virt**:只要這台是 VM,上面的碟就一定不是實體碟。
+  # 型號比對抓不完虛擬碟(EBS / PersistentDisk / QEMU… 列不完),所以主判準改用
+  # systemd-detect-virt:只要這台是 VM,上面的碟就一定不是實體碟。
   { [ -n "$VIRT" ] && [ "$VIRT" != "none" ]; } && HW_VDISK_HINT=1
   if [ -n "$VDRAID" ]; then
     printf -- '- **注意:上面的顆數不等於實體硬碟數**。`%s` 的廠牌 / 型號是 RAID 控制器做出來的 **virtual disk**(一列可能是一整櫃碟),**底下真正幾顆碟、哪一顆壞了 `lsblk` 一律看不到** —— 看下面「硬體 RAID(控制器)」段,或走 BMC。\n' "$VDRAID"
@@ -584,31 +550,21 @@ else
   note "無 lsblk,碟數與型號要人工查"
 fi
 printf '### 區塊裝置 / 分割\n```\n'
-# v1.6:-e 7 濾掉 loop 裝置(major 7)。microk8s 是 snap 裝的,AI Landing 主機上
-# 實測有 29 個 squashfs loop,把真正的磁碟結構整個淹掉 —— 跟 veth 洪水同一類問題。
-# v1.12(tph 實跑修正):結尾多一個 `| cat`。lsblk 會依終端機寬度截斷最後一欄 ——
-# 直接在終端機看時 tph 的表頭印成 `MOUNTPOIN`(掛載路徑長一點就會被切掉)。
-# stdout 是 pipe 時 lsblk 不截斷,所以 `| cat` 就解決了(導向檔案時本來就不會截,這是為了
-# 「在終端機跑完直接複製貼上」那種用法 —— 而那正是實際最常見的用法)。
+# -e 7 濾掉 loop 裝置(snap 裝的 microk8s 實測 29 個 squashfs,會淹掉磁碟結構)。
+# 結尾 `| cat`:lsblk 依終端機寬度會截斷最後一欄,stdout 是 pipe 時才不截斷。
 if have lsblk; then lsblk -e 7 -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>/dev/null | cat; else note "無 lsblk"; fi
 printf '```\n### 磁碟使用 / mount\n```\n'
 if have df; then df -hT 2>/dev/null | grep -vE 'tmpfs|overlay|squashfs'; fi
 printf '```\n'
-# v1.12(ukt 實跑發現):那台 `df` 有 `/dev/sde6`(668G,93% 滿,掛在 /mnt/usb),
-# 但 `lsblk` 從頭到尾沒有 sde —— 裝置已經不在 /sys/block(碟被拔掉 / 從控制器上掉了 /
-# 熱插拔後沒重掛),掛載卻還留著,`df` 照樣給數字。
-# **這種碟不會出現在「實體碟總覽」的顆數裡**,不標的話那個顆數會被當成完整清單。
-# 站頁模板 C4「`df` 看得到但 `lsblk` 沒列的碟」本來要人工發現,這裡直接算給他。
+# `df` 有但 `lsblk` 沒有的碟:裝置已不在 /sys/block(拔掉 / 掉出控制器 / 熱插拔沒重掛)但掛載還在。
+# **這種碟不算在「實體碟總覽」的顆數裡**,不標的話那個顆數會被當成完整清單。
 if have lsblk && [ -r /proc/mounts ]; then
   LSBLK_ALL="$(lsblk -alno NAME 2>/dev/null | tr -d ' ' | sort -u)"
   GHOSTDEV=""
   for _md in $(awk '$1 ~ /^\/dev\// {print $1}' /proc/mounts 2>/dev/null | sort -u); do
     _b="${_md#/dev/}"
-    # 只比對得了「單純的裝置名」。以下三類在 lsblk 是另一個名字,比對會產生假警報 ——
-    # 而一個假的「碟掉了」比不報還糟(同 v1.12 那條「不要無中生有缺口」的教訓):
-    #   ① dm / mapper:/dev/mapper/ubuntu--vg-ubuntu--lv,lsblk 叫 ubuntu--vg-ubuntu--lv
-    #   ② 任何帶 `/` 的路徑:/dev/disk/by-uuid/... 這種 symlink 形式(部分系統的 /proc/mounts 就長這樣)
-    #   ③ /dev/root:initramfs 交接後的別名,lsblk 沒有這個名字
+    # 只比對得了「單純的裝置名」;以下三類在 lsblk 是另一個名字,比對會產生假警報(假的
+    # 「碟掉了」比不報還糟):① dm/mapper;② 帶 `/` 的路徑(by-uuid symlink);③ /dev/root。
     case "$_b" in */*|dm-*|root) continue ;; esac
     printf '%s\n' "$LSBLK_ALL" | grep -qx "$_b" || GHOSTDEV="$GHOSTDEV $_b"
   done
@@ -618,13 +574,10 @@ if have lsblk && [ -r /proc/mounts ]; then
     printf -- '- **注意:有掛載中的裝置不在 `lsblk` 清單裡** —— `%s`。代表裝置已經不在 `/sys/block`(碟被拔掉、從控制器上掉了、或熱插拔後沒重掛),但掛載還在,所以 `df` 照樣有數字。**這種碟不算在上面的顆數裡,而且上面的容量數字未必還可信。** 照實記錄、不要自己判斷用途(站頁模板 C4 收這一類)。\n' "$GHOSTDEV"
   fi
 fi
-# v1.9:NFS 掛載的關鍵參數。上面的 df 只說「掛了誰、用了多少」,這裡說「怎麼掛的」。
-# 對 AI agent 這種要讀整片 WSI(GB 級)的用法,rsize/wsize 與 vers 直接決定吞吐;
-# hard vs soft 決定 NFS 卡住時是無限等待還是回錯(影響服務怎麼壞)。
-# 來源主機不重複列(上面 df 有),只列掛載點與參數,表才不會爆寬。
+# NFS 掛載參數:df 說「掛了誰、用多少」,這裡說「怎麼掛的」。rsize/wsize 與 vers 決定大檔吞吐,
+# hard vs soft 決定 NFS 卡住時是無限等待還是回錯。來源主機不重複列(上面 df 有)。
 printf '### NFS 掛載參數\n'
-# 只認 client 掛載:fstype 精確比對 nfs / nfs4。`$3 ~ /^nfs/` 會把 /proc/fs/nfsd
-# (NFS **server** 的控制用 filesystem)也算進來,實測 demo 機就中了這一槍。
+# 只認 client 掛載:fstype 精確比對 nfs / nfs4(`^nfs` 會把 server 側的 /proc/fs/nfsd 也算進來)。
 NFSTBL="$(awk '$3 == "nfs" || $3 == "nfs4" {
     opts = $4
     v = "-"; pr = "-"; rs = "-"; ws = "-"; hs = "-"; to = "-"; rt = "-"; ac = "-"
@@ -650,9 +603,8 @@ if [ -n "$NFSTBL" ]; then
 else
   printf -- '- 無 NFS 掛載(資料在本機碟)\n'
 fi
-# v1.12:舊版「沒有 md 就整段不印」,讀者分不出「這台沒有軟體 RAID」與「腳本沒查這件事」——
-# 跟 CPU steal 那個教訓同一類,所以改成一律印結論。
-# 另外只把 mdstat 原文貼出來是不夠的:degraded 在 `[U_]` 那一格,兩個字元,會被滑過去。
+# 一律印結論:舊版沒有 md 就整段不印,讀者分不出「沒有軟 RAID」與「腳本沒查」。
+# 而且只貼 mdstat 原文不夠:degraded 在 `[U_]` 那兩個字元,會被滑過去。
 printf '### 軟體 RAID(md)\n'
 if [ ! -r /proc/mdstat ]; then
   printf -- '- 讀不到 `/proc/mdstat`(kernel 沒有 md 模組)\n'
@@ -671,11 +623,8 @@ else
     kv "md 陣列健康" "成員全部在線(狀態列無 \`_\`)。**這不代表碟是健康的** —— 硬碟壽命看下方 SMART"
   fi
   printf '```\n%s\n```\n' "$MDSTAT"
-  # v1.12(ukt 實跑補的):那台的 root 跑在 Intel RST(主機板 fakeRAID)上,mdstat 長這樣:
-  #   md126 : active raid1 sda[1] sdb[0] ... super external:/md127/0 [2/2] [UU]
-  #   md127 : inactive sda[1](S) sdb[0](S) ... super external:imsm
-  # **`inactive` 那一行是 metadata container,不是壞掉的陣列** —— 每台 Intel RST 機器都長這樣。
-  # 不解釋的話交接的人看到 inactive 會以為出事(而判定式又說「成員全部在線」,更混亂)。
+  # Intel RST(主機板 fakeRAID)的 mdstat 會有一行 `inactive … super external:imsm` ——
+  # 那是 metadata container,**顯示 inactive 是正常的**,不解釋會被當成故障。
   if printf '%s\n' "$MDSTAT" | grep -q 'external:imsm'; then
     IMSM_SEEN=1
     printf -- '- _`external:imsm` = **Intel RST(主機板 fakeRAID)**,不是 Linux 原生 md 也不是硬體 RAID 卡:陣列由主機板 BIOS 定義、由 kernel 的 md 驅動實際運作。其中 `inactive … (S)` 那一行是 **metadata container,顯示 inactive 是正常的**,真正的陣列是它上面那個 `active` 的 md。要換碟或看細節走 BIOS 的 Intel RST 設定畫面_\n'
@@ -683,50 +632,46 @@ else
   if have mdadm && sudo_ready; then
     for _md in /dev/md*; do
       [ -b "$_md" ] || continue
-      _det="$(sudo -n mdadm --detail "$_md" 2>/dev/null |
+      _det="$(sq mdadm --detail "$_md" 2>/dev/null |
               grep -E 'Raid Level|Array Size|Raid Devices|Total Devices|State :|Active Devices|Working Devices|Failed Devices|Spare Devices|Rebuild Status|Consistency Policy')"
       [ -n "$_det" ] && printf -- '- **%s**(`mdadm --detail`)\n```\n%s\n```\n' "$_md" "$_det"
     done
   elif ! have mdadm; then
     note "有 md array 但沒有 mdadm 指令,成員碟明細抓不到"
   else
-    printf -- '- _RAID level / 幾顆 / 哪一顆掉 / 重建進度要 `mdadm --detail`(需 root):加 `--with-sudo` 重跑_\n'
+    printf -- '- _RAID level / 幾顆 / 哪一顆掉 / 重建進度要 `mdadm --detail`(需 root:%s)_\n' "${SUDO_NOTE:-未判定}"
   fi
 fi
-# LVM:vgs/lvs 非 root 會把警告丟到 stderr、stdout 留空,看起來像「這台沒有 LVM」。
-# 所以要分辨「真的沒有」與「沒權限」,--with-sudo 時再試一次。
-# v1.12:lvs 加 segtype —— LVM 自己也能做 RAID(raid1/raid5/mirror),預設欄位看不出來,
-# 一個 linear LV 跟一個 raid1 LV 印出來長得一樣。
+# LVM:vgs/lvs 非 root 會把警告丟 stderr、stdout 留空,看起來像「沒有 LVM」→ 要分辨沒權限。
+# lvs 加 segtype:LVM 自己也能做 RAID,預設欄位看不出 linear 與 raid1 的差別。
 if have vgs; then
   LVM_OUT="$(vgs 2>/dev/null; lvs -o +segtype 2>/dev/null)"
-  if [ -z "$LVM_OUT" ] && [ "$WITH_SUDO" = "1" ]; then
-    LVM_OUT="$(sudo -n vgs 2>/dev/null; sudo -n lvs -o +segtype 2>/dev/null)"
+  if [ -z "$LVM_OUT" ] && sudo_ready; then
+    LVM_OUT="$(sq vgs 2>/dev/null; sq lvs -o +segtype 2>/dev/null)"
   fi
   printf '### LVM\n'
   if [ -n "$LVM_OUT" ]; then
     printf '```\n%s\n```\n' "$LVM_OUT"
   elif lsblk -o FSTYPE 2>/dev/null | grep -q LVM2_member; then
-    note "偵測到 LVM2_member 分割,但 vgs/lvs 需要 root 才讀得到(可加 --with-sudo,或人工確認)"
+    note "偵測到 LVM2_member 分割,但 vgs/lvs 需要 root 才讀得到($SUDO_NOTE)"
   else
     printf -- '- 無 LVM\n'
   fi
 fi
-# v1.12:ZFS / btrfs —— 軟體 RAID 的另外兩種。儲存主機不一定用 md,只查 mdstat 會漏掉整片陣列。
-# 沿用 LVM 那套「非 root 空手時要分辨『真的沒有』與『沒權限』」的做法。
+# ZFS / btrfs:軟體 RAID 的另外兩種,只查 mdstat 會漏掉整片陣列。沿用 LVM 那套權限判斷。
 printf '### ZFS\n'
 if ! have zpool; then
   printf -- '- 無 ZFS(沒有 `zpool` 指令)\n'
 else
   ZP="$(zpool list 2>/dev/null)"
-  { [ -z "$ZP" ] && sudo_ready; } && ZP="$(sudo -n zpool list 2>/dev/null)"
+  { [ -z "$ZP" ] && sudo_ready; } && ZP="$(sq zpool list 2>/dev/null)"
   if [ -z "$ZP" ]; then
-    printf -- '- 裝了 ZFS 但沒有 pool(或 `zpool` 需要 root:可加 `--with-sudo`)\n'
+    printf -- '- 裝了 ZFS 但沒有 pool(或 `zpool` 需要 root:%s)\n' "${SUDO_NOTE:-未判定}"
   else
     printf '```\n%s\n```\n' "$ZP"
-    # `zpool status -x` 是專門的一行式健康判定:全好時只印 "all pools are healthy",
-    # 有問題才印出哪個 pool 的哪顆碟 —— 比整份 status 更適合放進紀錄。
+    # `zpool status -x` 是一行式健康判定(全好只印 all pools are healthy),比整份 status 適合紀錄。
     ZS="$(zpool status -x 2>/dev/null)"
-    { [ -z "$ZS" ] && sudo_ready; } && ZS="$(sudo -n zpool status -x 2>/dev/null)"
+    { [ -z "$ZS" ] && sudo_ready; } && ZS="$(sq zpool status -x 2>/dev/null)"
     [ -n "$ZS" ] && printf -- '- **pool 健康**(`zpool status -x`)\n```\n%s\n```\n' "$ZS"
   fi
 fi
@@ -737,19 +682,17 @@ if lsblk -o FSTYPE 2>/dev/null | grep -q btrfs; then
     note "有 btrfs 分割但沒有 btrfs 指令,RAID profile 抓不到"
   else
     BT="$(btrfs filesystem show 2>/dev/null)"
-    { [ -z "$BT" ] && sudo_ready; } && BT="$(sudo -n btrfs filesystem show 2>/dev/null)"
+    { [ -z "$BT" ] && sudo_ready; } && BT="$(sq btrfs filesystem show 2>/dev/null)"
     if [ -n "$BT" ]; then
       printf '```\n%s\n```\n' "$BT"
       printf -- '- _RAID profile(single / raid1 / raid10)要 `btrfs filesystem df <掛載點>` 逐個掛載點看,本腳本不逐點掃_\n'
     else
-      note "btrfs filesystem show 需要 root(可加 --with-sudo)"
+      note "btrfs filesystem show 需要 root($SUDO_NOTE)"
     fi
   fi
 fi
-# v1.12:硬體 RAID —— 舊版完全空白的一塊。
-# 分兩層:① 控制器型號(lspci,非 root 可讀,先回答「這台有沒有硬體 RAID」);
-#         ② 陣列狀態(只有廠商 CLI 問得到,需 root)。
-# 兩層都拿不到時**要明講量不到**,不能讓上面的「md 成員全部在線」被讀成「陣列沒問題」。
+# 硬體 RAID 分兩層:① 控制器型號(lspci,非 root 可讀);② 陣列狀態(只有廠商 CLI 問得到,需 root)。
+# 兩層都拿不到時要明講量不到,不能讓「md 成員全部在線」被讀成「陣列沒問題」。
 printf '### 硬體 RAID(控制器)\n'
 # HWCTL / HW_CTL_RAID 在「實體碟總覽」之前就算好了(見那裡的註解),這裡只負責印
 if ! have lspci; then
@@ -757,8 +700,7 @@ if ! have lspci; then
 elif [ -n "$HWCTL" ]; then
   printf '```\n%s\n```\n' "$HWCTL"
   printf -- '- _`RAID bus controller` = 硬體 RAID 卡或主機板 RAID 模式;`Serial Attached SCSI controller` 多半是純 HBA(不做 RAID,RAID 在 OS 層);`SATA controller` / `Non-Volatile memory controller` = 主機板內建,碟是直連_\n'
-  # v1.12(tph 實跑修正):這句話原本無條件印,但 tph 只有一張 NVMe 控制器、也沒有 imsm ——
-  # 照印會出現一句指向不存在的東西的說明。只有真的兩者並存時才有意義。
+  # 只有「控制器層 + 主機板 fakeRAID」真的並存時才印這句,否則會指向不存在的東西。
   [ "$IMSM_SEEN" = "1" ] && [ "$HW_CTL_RAID" = "1" ] &&
     printf -- '- _這台兩種並存:系統碟走主機板 RAID(見上方 md 段的 `external:imsm`),資料碟走 RAID 卡_\n'
 else
@@ -775,11 +717,8 @@ for _c in storcli64 storcli perccli64 perccli ssacli hpssacli hpacucli arcconf s
   [ -n "$RCLI" ] && break
 done
 if [ -z "$RCLI" ]; then
-  # v1.12 實跑修正:demo 機沒有 RAID 卡(只有主機板 SATA + NVMe 直連),舊寫法照印
-  # 「陣列健康量不到,要走 BMC」—— 那會讓人以為有個看不到的陣列。**沒有陣列就不要說量不到**,
-  # 這跟 v1.10 印誤導性的 0.00% 是同一類錯,只是方向相反(無中生有的缺口)。
-  # 所以三種情況要講三句不同的話。判準有兩個來源:碟型號露餡(HW_RAID_HINT)或 lspci 有 RAID 卡
-  # (HW_CTL_RAID)—— 任一成立就算「有陣列但量不到」。
+  # **沒有陣列就不要說量不到**(無中生有的缺口比漏報還糟)。三句話:有卡沒 CLI → BMC;
+  # 虛擬碟 → 問虛擬化管理者;兩者皆無 → 沒有控制器層的陣列要查。
   if [ "$HW_RAID_HINT" = "1" ] || [ "$HW_CTL_RAID" = "1" ]; then
     printf -- '- **有 RAID 控制器但沒有廠商 CLI**(找過 storcli / perccli / MegaCli / ssacli / arcconf / sas3ircu / tw_cli,PATH 與 /opt 常見路徑都沒有)\n'
     printf -- '- **所以陣列健康、有沒有 degraded、是哪一顆壞、底下幾顆碟,這台量不到** —— 這些都在控制器層,`lsblk` / `mdstat` / `df` 一律看不到。要走 **BMC(iDRAC / iLO / IPMI web)**,或請客戶裝廠商 CLI 後重跑。\n'
@@ -790,8 +729,7 @@ if [ -z "$RCLI" ]; then
   fi
 else
   kv "廠商 CLI" "\`$RCLI\`"
-  # 每種卡的唯讀查詢指令不同。一律只用 show / display / info / GETCONFIG 這類「讀」的子指令,
-  # 不下任何 set / start / rebuild —— 正式機上這段必須是純查詢。
+  # 一律只用 show / display / info / GETCONFIG 這類「讀」的子指令,不下 set / start / rebuild。
   case "$(basename "$RCLI")" in
     storcli*|perccli*)  RCLI_CMD="$RCLI /c0 show" ;;             # 一頁含 controller + VD + PD 狀態
     MegaCli*|megacli)   RCLI_CMD="$RCLI -LDInfo -Lall -aALL" ;;  # PD 明細另有 -PDList,太長不自動跑
@@ -804,14 +742,12 @@ else
   if [ -z "$RCLI_CMD" ]; then
     note "認得這支 CLI 但沒有對應的唯讀查詢指令,請人工執行"
   elif sudo_ready; then
-    RCLI_OUT="$(sudo -n $RCLI_CMD 2>/dev/null)"
+    # shellcheck disable=SC2086
+    RCLI_OUT="$(sq $RCLI_CMD 2>/dev/null)"
     if [ -n "$RCLI_OUT" ]; then
       printf -- '- 唯讀查詢:`%s`\n' "$RCLI_CMD"
-      # v1.12(ukt 實跑修正):`storcli /c0 show` 實測約 175 行,而且**最有價值的 PD LIST 在後段**
-      # —— 原本 `head -150` 正好把它切掉。而且就算全貼,要人從 175 行裡數「幾顆碟、有沒有壞」
-      # 也不合理:**這一段的存在理由就是回答那兩個問題**。
-      # 所以先解析出摘要(欄位直接對應站頁模板 C2:陣列 / RAID level / 成員碟 / 狀態),再貼原文。
-      # 只解析 storcli / perccli 的格式(其他廠商 CLI 版面不同,沒有摘要就只貼原文)。
+      # `storcli /c0 show` 約 175 行、最有價值的 PD LIST 在後段(舊版 head -150 正好切掉)。
+      # 先解析摘要(對應站頁模板 C2:陣列 / level / 成員碟 / 狀態)再貼原文;只解析 storcli / perccli。
       case "$(basename "$RCLI")" in
         storcli*|perccli*)
           printf '%s\n' "$RCLI_OUT" | awk '
@@ -864,22 +800,14 @@ else
       note "$RCLI 執行不到內容(可能不是這張卡的工具、或這台沒有 RAID 控制器)"
     fi
   else
-    # v1.12(ukt 實跑修正):要分清楚「沒加旗標」與「加了但拿不到 root」,否則使用者
-    # 看到「沒有 root」會以為是權限問題,其實只是這次沒帶 --with-sudo。
-    if [ "$WITH_SUDO" = "1" ]; then
-      printf -- '- _有 CLI 但拿不到 root(沒有免密 sudo,且沒有 tty 或腳本是從 stdin 餵入)。陣列狀態請在該機人工執行(唯讀):_\n'
-    else
-      printf -- '- _**有 CLI,但這次沒帶 `--with-sudo` 所以沒查**。加旗標重跑就會抓,或在該機人工執行(唯讀):_\n'
-    fi
+    # sudo 已內建,「沒查到」只剩一個原因 —— 這次拿不到 root,把原因直接印出來。
+    printf -- '- _**有 CLI 但這次拿不到 root,所以陣列狀態沒查**。原因:%s。請在該機人工執行(唯讀):_\n' "${SUDO_NOTE:-未判定}"
     printf '```\nsudo %s\n```\n' "$RCLI_CMD"
   fi
 fi
-# v1.12:SMART —— **刻意只取整體健康判定那一行**。通電時數 / 重配置磁區 / NVMe 壽命% 不抓:
-# 那是持續監控的指標(要看趨勢),不是交接紀錄要的東西,而且每顆碟都倒一份會把報告淹掉。
+# SMART 刻意只取整體判定:通電時數 / 重配置磁區 / 壽命% 屬監控指標,每顆碟一份也會淹掉報告。
 printf '### 硬碟健康(SMART,只取整體判定)\n'
-# v1.12(tph 實跑修正):VM 上這一段整個不適用 —— tph 是 AWS,碟是 EBS,舊寫法照印
-# 「量不到,要看就走 BMC」,但**雲端沒有 BMC**,而且虛擬碟本來就沒有 SMART 可言。
-# 這是「不要無中生有缺口」的第三個實例(前兩個:demo 機的假 RAID 缺口、tph 的假 BMC 建議)。
+# VM 上這段不適用:虛擬碟沒有實體 SMART。而且**雲端沒有 BMC**,不能照抄「走 BMC」那句。
 IS_VM=0
 { [ -n "$VIRT" ] && [ "$VIRT" != "none" ]; } && IS_VM=1
 if [ "$IS_VM" = "1" ]; then
@@ -895,15 +823,11 @@ elif ! have smartctl; then
   [ "$HW_RAID_HINT" = "1" ] || [ "$HW_CTL_RAID" = "1" ] &&
     printf -- '- _這台的碟在 RAID 控制器後面,即使裝了 smartmontools 也要走 `-d megaraid,N`;**用上面的廠商 CLI 看 PD 狀態更直接**_\n'
 elif ! sudo_ready; then
-  if [ "$WITH_SUDO" = "1" ]; then
-    printf -- '- 有 `smartctl` 但拿不到 root,硬碟健康略過。原因是「沒有免密 sudo」加上以下任一:沒有 tty、或**腳本是從 stdin 餵進來的**(`bash -s < 腳本` / `curl | bash` —— 那種跑法不會問密碼,因為 sudo 會跟腳本搶同一條 stdin)。要抓就把腳本落地到該機再跑:`bash 腳本 --with-sudo`\n'
-  else
-    printf -- '- 有 `smartctl`,但 SMART 需要 root:加 `--with-sudo` 重跑(會問一次密碼)\n'
-  fi
+  printf -- '- 有 `smartctl`,但 SMART 需要 root,**這次拿不到所以略過**。原因:%s\n' "${SUDO_NOTE:-未判定}"
+  printf -- '- _若原因是「腳本從 stdin 餵入」(`bash -s < 腳本` / `curl | bash`),那種跑法不會問密碼(sudo 會跟腳本搶同一條 stdin)—— 把腳本落地到該機再跑就會問:`bash %s`_\n' "$SCRIPT_NAME"
 else
-  # 裝置清單優先用 smartctl 自己的 --scan-open:RAID 控制器後面的碟要 `-d megaraid,N` 這種
-  # 語法才問得到,手寫 /dev/sdX 清單問不到。掃不出來才退回 lsblk 的實體碟清單。
-  SMDEV="$(sudo -n smartctl --scan-open 2>/dev/null | sed 's/#.*//; s/[[:space:]]*$//' | grep -v '^$')"
+  # 裝置清單優先用 --scan-open:控制器後面的碟要 `-d megaraid,N` 才問得到,手寫 /dev/sdX 問不到。
+  SMDEV="$(sq smartctl --scan-open 2>/dev/null | sed 's/#.*//; s/[[:space:]]*$//' | grep -v '^$')"
   SMSRC="smartctl --scan-open"
   if [ -z "$SMDEV" ]; then
     SMDEV="$(printf '%s\n' "$DISKROWS" | awk 'NF{print "/dev/"$1}')"
@@ -916,9 +840,9 @@ else
     printf '%-34s %s\n' DEVICE HEALTH   # 表頭用 ASCII,理由同「實體碟總覽」那張表
     printf '%s\n' "$SMDEV" | while IFS= read -r _d; do
       [ -n "$_d" ] || continue
-      # $_d 可能是「/dev/bus/0 -d megaraid,8」這種多字串,要讓它自然斷字,所以刻意不加引號
+      # $_d 可能是「/dev/bus/0 -d megaraid,8」多字串,刻意不加引號讓它斷字
       # shellcheck disable=SC2086
-      _out="$(sudo -n smartctl -H $_d 2>&1)"
+      _out="$(sq smartctl -H $_d 2>&1)"
       _res="$(printf '%s\n' "$_out" | grep -iE 'overall-health|SMART Health Status' | sed -E 's/.*: *//' | head -1)"
       if [ -z "$_res" ]; then
         _res="量不到($(printf '%s\n' "$_out" | grep -iE 'unable|unknown|failed|permission|not supported|Open failed' | head -1 | cut -c1-56))"
@@ -931,9 +855,8 @@ else
     printf -- '- _通電時數 / 重配置磁區 / NVMe 壽命%% 本腳本刻意不抓(屬監控指標,不是環境紀錄)_\n'
   fi
 fi
-# v1.8:上面的 mount 是「這台掛了誰的資料」,這裡是反過來「這台把資料分享給誰」。
-# samba 不屬於 aetherSlide 部署(compose 裡沒有 SMB server),有的話一定是站台自建或
-# 客戶 IT 推的,所以只讀設定檔列出分享名與 path,不判斷用途。密碼類鍵不抓。
+# 反過來:「這台把資料分享給誰」。samba 不屬於 aetherSlide(compose 沒有 SMB server),
+# 有的話一定是站台自建或客戶 IT 推的 —— 只列分享名與 path,不判斷用途,密碼類鍵不抓。
 printf '### 本機分享出去的目錄(samba)\n'
 SMBCONF=/etc/samba/smb.conf
 if [ ! -f "$SMBCONF" ]; then
@@ -964,8 +887,7 @@ else
     printf -- '- `%s` 存在但沒有 `[global]` 以外的分享區段\n' "$SMBCONF"
   fi
 fi
-# v1.9:同一類的另一半 —— 這台當 NFS server 分享出去的目錄。實測 demo 機有 /proc/fs/nfsd
-# (= 裝了 nfs-kernel-server)才發現 v1.8 只做了 samba 這一半。
+# 同一類的另一半:這台當 NFS server 分享出去的目錄。
 # `exportfs -s` 要 root,所以讀設定檔:/etc/exports 加 /etc/exports.d/*.exports。
 printf '### 本機分享出去的目錄(NFS export)\n'
 EXPFILES=""
@@ -996,17 +918,15 @@ if [ -d /proc/fs/nfsd ]; then
   printf -- '- **本機有 `/proc/fs/nfsd`**(裝了 `nfs-kernel-server`);它是否真的在服務要看上面的 export 清單\n'
 fi
 
-# ── 5. 執行中的 aetherSlide ──────────────────────────────
-# v1.6:整節用 HAS_AS 包起來。AI 推論主機常常沒有 aetherSlide(GPU 分開裝),
-# 舊版會照樣印出十幾個空欄位與「無執行中 container」,看起來像「裝了但全掛了」。
+# ── 5. 執行中的 aetherSlide ──────
+# 整節用 HAS_AS 包起來:AI 推論主機常沒有 aetherSlide,照印空欄位會像「裝了但全掛了」。
 sec "5. 執行中的 aetherSlide"
 if [ "$HAS_AS" = "0" ]; then
   note "本機沒有 aetherSlide 部署($DEPLOY_DIR 找不到 configs.env / .env),本節略過"
   note "部署在別的路徑的話用第一個參數指定:bash collect_site_config.sh /path/to/website"
 else
   kv "部署目錄" "$DEPLOY_DIR"
-  # 版本:.env 的 TAG 是「設定要跑哪版」,實際跑的 image tag 是「現在真的在跑哪版」。
-  # 兩者不一致 = 改了 TAG 但沒重建。hotfix / 客製版仍要人工補註記。
+  # .env 的 TAG 是「設定要跑哪版」,實際 image tag 是「現在真的在跑哪版」;不一致 = 改了沒重建。
   kv "aetherSlide 版本 TAG(設定值)" "$(envval "$DEPLOY_DIR/.env" TAG)"
   if have docker; then
     # 只看自家 registry 的 image;redis 等第三方 image 的 tag 不是 aetherSlide 版本
@@ -1051,7 +971,7 @@ else
   fi
 fi
 
-# ── 6. 時間與排程 ──────────────────────────────
+# ── 6. 時間與排程 ──────
 sec "6. 時間與排程"
 if have timedatectl; then
   kv "時區 / NTP" "$(timedatectl 2>/dev/null | tr -s ' ' | grep -E 'Time zone|NTP' | paste -sd '; ' -)"
@@ -1062,10 +982,8 @@ printf '### 使用者 crontab\n```\n'
 crontab -l 2>/dev/null || printf '(無 crontab 或讀不到)\n'
 printf '```\n'
 if have systemctl; then
-  # v1.8:白名單加 smb/nmb/winbind/nfs-server —— 這類不屬於 aetherSlide,但常常正在
-  # 把 aetherSlide 的資料分享出去(ukt node-1 的 samba 就是這樣被漏掉的)。
-  # v1.12:再加 smartd/mdmonitor/zed/multipathd —— 「碟壞了有沒有人會被通知」跟「碟現在好不好」
-  # 是兩件事,交接都要知道(mdcheck_* timer 走下面的 timer 段,黑名單沒濾掉它)。
+  # 白名單含 smb/nmb/winbind/nfs-server(不屬 aetherSlide 但常在分享它的資料)與
+  # smartd/mdmonitor/zed/multipathd(「碟壞了有沒有人被通知」跟「碟好不好」是兩件事)。
   UNITS="$(systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null \
     | grep -iE 'docker|compose|aetherslide|website|microk8s|kubelet|containerd|smbd|nmbd|winbind|nfs-server|smartd|mdmonitor|zed|multipathd' | awk '{print $1}')"
   printf '### 相關 systemd service\n'
@@ -1077,11 +995,8 @@ if have systemctl; then
   if [ -n "$TIMERS" ]; then printf '```\n%s\n```\n' "$TIMERS"; else printf -- '- 無\n'; fi
 fi
 
-# ── 7. GPU node / AI Landing(AI 推論主機)──────────────────────────────
-# v1.6 新增。AI Landing 是 microk8s + helm,不是 docker compose,所以整段是另一套指令。
-# 跟 dual node 不同,這裡「不」自動 SSH 過去:dual 兩台是同一套部署、同一批人裝的,
-# 節點間免密 SSH 還有機會;aetherSlide 與 GPU 主機常屬不同網段甚至不同單位,
-# 自動連只會生一堆失敗訊息,不如明講「到那台再跑一次」。
+# ── 7. GPU node / AI Landing(AI 推論主機)──────
+# microk8s + helm,不是 docker compose,所以整段是另一套指令。不自動 SSH 過去。
 sec "7. GPU node / AI Landing(AI 推論)"
 if [ "$HAS_AIL" = "0" ]; then
   note "本機沒有 AI Landing(找不到部署目錄的 values.yaml,也沒有 $AIL_NS namespace)"
@@ -1092,8 +1007,8 @@ if [ "$HAS_AIL" = "0" ]; then
       kv "AI_LANDING_URL 指向" "$AIL_URL(是本機 IP,但本機偵測不到 AI Landing → 需人工確認)"
     else
       kv "AI_LANDING_URL 指向" "$AIL_URL(**不是本機**,AI 推論在另一台)"
-      printf -- '- _請到那台主機再跑一次本腳本,把它的第 1–7 段貼進站頁 M-machine 的「GPU node」段:_\n'
-      printf '```\nbash collect_site_config.sh --no-remote\n```\n'
+      printf -- '- _請到那台主機再跑一次本腳本(那台要另外貼一份),把它的第 1–7 段貼進站頁 M-machine 的「GPU node」段:_\n'
+      printf '```\nbash collect.sh\n```\n'
       printf -- '- _FQDN 的話實際 IP 由客戶 DNS/NAT 決定,要人工確認解析到哪台_\n'
     fi
   else
@@ -1110,8 +1025,7 @@ else
   fi
 
   # ── 版本:三個來源要並列 ──
-  # 實測 gpu-a4000:helm 顯示 0.0.0-<sha>、Chart.yaml 寫 1.1.18、image tag 是 git sha。
-  # CI build 的部署 appVersion 會變成 0.0.0-<sha>,只抓一個會誤導。
+  # helm appVersion(CI build 會變成 0.0.0-<sha>)、Chart.yaml、image tag 三者常不同,只抓一個會誤導。
   printf '### 版本(三個來源,不一致是常態,要一起看)\n'
   kv "Chart.yaml appVersion(部署目錄)" "$(yamlval "$AIL_DIR/charts/ai-landing/Chart.yaml" '^appVersion:')"
   if [ -n "$HELM" ]; then
@@ -1148,8 +1062,7 @@ else
   fi
 
   # ── 對外端點 ──
-  # 實測:8500 是 svc/ingress 的 externalIPs,由 kube-proxy 的 iptables 轉,
-  # 主機上「沒有」listening socket,ss -ltnp 抓不到 —— 只能問 k8s。
+  # 8500 是 svc/ingress 的 externalIPs,由 kube-proxy iptables 轉;主機上沒有 listening socket。
   if [ -n "$KCTL" ]; then
     printf '### 對外端點(externalIPs 沒有 listening socket,ss 抓不到,只能問 k8s)\n'
     ING_SVC="$(kctl get svc -A --no-headers -o 'custom-columns=NS:.metadata.namespace,NAME:.metadata.name,TYPE:.spec.type,EXTIP:.spec.externalIPs[*],PORT:.spec.ports[*].port' | awk '$4!="<none>"')"
@@ -1180,9 +1093,7 @@ else
   fi
 
   # ── pod 狀態 ──
-  # 實測 gpu-a4000:這個 namespace 有 1369 個 pod,其中 1359 個是推論 job 留下的。
-  # 無腦 `get pods` 會吐 1369 行把報告淹掉,所以依 ownerReferences 拆兩半:
-  # Job 擁有的只給統計,其餘(Deployment/StatefulSet/DaemonSet)才逐一列。
+  # 推論 job 留下的 pod 可達上千個(實測 1369)→ 依 ownerReferences 拆:Job 只給統計,其餘逐一列。
   if [ -n "$KCTL" ]; then
     PODS="$(kctl get pods -n "$AIL_NS" --no-headers -o 'custom-columns=OWNER:.metadata.ownerReferences[*].kind,NAME:.metadata.name,PHASE:.status.phase,REASON:.status.reason,READY:.status.containerStatuses[*].ready,RESTARTS:.status.containerStatuses[*].restartCount')"
     CORE="$(printf '%s\n' "$PODS" | awk '$1!="Job"')"
@@ -1200,9 +1111,8 @@ else
     JOB_N="$(kctl get jobs -n "$AIL_NS" --no-headers | wc -l | tr -d ' ')"
     kv "job 總數" "${JOB_N:-0}"
     printf '```\n%s\n```\n' "$(printf '%s\n' "$PODS" | awk '$1=="Job"{print $3" "$4}' | sort | uniq -c | sort -rn)"
-    # 這是模板「AI model 版本」那格唯一抓得到的來源:跑過哪些 AI app 與版本。
-    # 實測會混進 prometheus / grafana / postgres 等基礎設施 image,所以先只留 /ai-app/;
-    # 客製 registry 路徑可能不長這樣,一個都沒命中就退回列全部並註明(同 v1.3 image tag 的做法)。
+    # 模板「AI model 版本」那格唯一的來源。會混進 prometheus / grafana 等基礎設施 image,
+    # 所以先只留 /ai-app/;一個都沒命中就退回列全部並註明。
     ALL_IMG="$(kctl get pods -n "$AIL_NS" --no-headers -o 'custom-columns=IMG:.spec.containers[*].image' |
       tr ',' '\n' | sed 's/^ *//' | grep -v '^$')"
     APP_IMG="$(printf '%s\n' "$ALL_IMG" | grep '/ai-app/' | sort | uniq -c | sort -rn)"
@@ -1232,11 +1142,10 @@ else
   printf -- '_哪些 aetherSlide 站台連這台、GPU 由誰採購保固、模型更新誰做,設定看不出來,要人工填_\n'
 fi
 
-# ── 8. 對接與整合設定(從 configs.env 讀,不含任何密碼類鍵)─────────────
-# 這段屬 M-config 層(設定檔說了什麼),不是機器現況 —— 貼到站頁的「對接(整合)」。
+# ── 8. 對接與整合設定(從 configs.env 讀,不含任何密碼類鍵)──────
+# 屬 M-config 層,貼到站頁的「對接(整合)」。
 sec "8. 對接與整合設定(→ 貼到 M-config 的「對接(整合)」)"
-# v1.5:configs.env 裡的 DICOM / HL7 等鍵就算沒用到也會有預設值,
-# 模組沒列在 MODULES 裡就代表那個服務根本沒起、設定不生效 —— 不註明會讓人以為有對接。
+# DICOM / HL7 等鍵沒用到也有預設值:模組沒列在 MODULES 裡就代表服務沒起、設定不生效。
 MODULES_VAL="$(envval "$DEPLOY_DIR/configs.env" MODULES | tr -d ' ')"
 mod_off() {   # 模組不在 MODULES 裡就回傳提示字串
   if printf '%s' ",$MODULES_VAL," | grep -q ",$1,"; then printf ''
@@ -1255,48 +1164,31 @@ if [ -f "$DEPLOY_DIR/configs.env" ]; then
   kv "分層儲存 GIGASTORE_ENABLE_TIERING" "$(envval "$DEPLOY_DIR/configs.env" GIGASTORE_ENABLE_TIERING)(1=開)"
   kv "匯出路徑" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__EXPORT_PATH)"
   kv "NDPI 匯入時轉 DICOM" "$(envval "$DEPLOY_DIR/configs.env" WEB_BACKEND__CONVERT_NDPI_TO_DICOM_ON_IMPORT)(1=開)"
-  # AI 推論的去向。註解掉時走程式預設(舊版預設是已廢棄的 http://dgx.aetherai.com),
-  # 所以「configs.env 沒這行」不等於「沒有 AI 推論」,要標出來而不是留空。
-  # (AIL_URL 在檔案上方就算好了,見 v1.7 註記)
+  # AI 推論去向。註解掉時走程式預設(舊版預設是已廢棄的 FQDN),「沒這行」不等於「沒有 AI 推論」。
   kv "AI_LANDING_URL(AI 推論端點)" "${AIL_URL:-(未設定 / 被註解 → 走程式預設值,需查該版預設)}"
   printf -- '_掃描機型號 / PACS-LIS-HIS 對接對象 / 對方 IP 與 port 仍需人工填(設定檔看不出來)_\n'
 else
   note "讀不到 $DEPLOY_DIR/configs.env"
 fi
 
-# ── 9. 另一個節點(dual;SSH 一次收齊兩台)──────────────────────────────
-# 遠端跑的是同一份腳本(從 stdin 餵過去,不落地),並帶 --no-remote 避免互相遞迴。
-PEER_TARGET="$PEER"
-[ -n "$PEER_TARGET" ] || { [ "$ARCH" = "dual" ] && PEER_TARGET="$PEER_IP"; }
-
-if [ "$DO_REMOTE" = "1" ] && [ -n "$PEER_TARGET" ]; then
-  sec "9. 另一個節點(遠端採集:$PEER_TARGET)"
-  REMOTE_ARGS="--remote-child"
-  [ "$DEPLOY_DIR_EXPLICIT" = "1" ] && REMOTE_ARGS="$REMOTE_ARGS '$DEPLOY_DIR'"
-  if [ -z "$SELF" ] || [ ! -r "$SELF" ]; then
-    note "讀不到腳本自身檔案(可能是 pipe 執行),無法送到遠端;請在 $PEER_TARGET 上自行執行本腳本"
-  elif ! have ssh; then
-    note "本機無 ssh"
-  elif ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
-        "$PEER_TARGET" "bash -s -- $REMOTE_ARGS" < "$SELF" 2>/tmp/.sc_ssh_err; then
-    :
-  else
-    printf -- '- _SSH 到 %s 失敗(BatchMode:不會問密碼)。原因:_\n' "$PEER_TARGET"
-    printf '```\n%s\n```\n' "$(cat /tmp/.sc_ssh_err 2>/dev/null)"
-    printf -- '- _請改用 `--peer user@host` 指定正確帳號,或到另一台執行:_\n'
-    printf '```\nbash collect_site_config.sh %s--no-remote\n```\n' \
-      "$([ "$DEPLOY_DIR_EXPLICIT" = "1" ] && printf '%s ' "$DEPLOY_DIR")"
-  fi
-  rm -f /tmp/.sc_ssh_err 2>/dev/null
-elif [ "$ARCH" = "dual" ] && [ "$CHILD" = "0" ]; then
+# ── 9. 另一個節點(dual)──────
+# 只提醒「有另一台、是哪一台」:不自動連過去,跑法也不印在報告裡(要指令就用 --peer)。
+if [ "$ARCH" = "dual" ]; then
   sec "9. 另一個節點"
-  if [ "$DO_REMOTE" = "0" ]; then
-    note "--no-remote:只採本機,另一台請自行執行"
+  if [ -n "$PEER_IP" ]; then
+    kv "對方節點" "$PEER_IP$([ -n "$NODE_SELF" ] && printf '(本機是 %s)' "$NODE_SELF")"
+    printf -- '- 那一台要自己再跑一次;要指令就跑 `bash %s --peer <帳號>@%s`(只印指令,不會採本機)\n' \
+      "$SCRIPT_NAME" "$PEER_IP"
   else
-    note "dual 架構但推不出對方 IP(.env 的 NODE_1_IP/NODE_2_IP 未填?),請用 --peer [user@]host 指定"
+    if [ -n "$NODE_1_IP$NODE_2_IP" ]; then
+      note "**本機不是 dual 的任一節點**(IP 不在 NODE_1_IP=${NODE_1_IP:-未填} / NODE_2_IP=${NODE_2_IP:-未填} 上)—— 這台多半是 witness / ES 或其他角色機,dual 那兩台要各自跑一次"
+    else
+      note "dual 架構但 .env 沒填 NODE_1_IP / NODE_2_IP,推不出這站的兩個節點是誰 —— 要人工確認"
+    fi
   fi
 fi
 
-[ "$CHILD" = "0" ] &&
-  printf '\n---\n_採集完成。硬體序號/保固、對接對方是誰、聯絡窗口等需人工填寫的欄位不在此輸出(屬站頁 H 層)。_\n'
+printf '\n---\n_採集完成。對接對方是誰、聯絡窗口等需人工填寫的欄位不在此輸出(屬站頁 H 層)。_\n'
+printf '\n===== 以上結束複製 =====\n' >&2
+
 exit 0
