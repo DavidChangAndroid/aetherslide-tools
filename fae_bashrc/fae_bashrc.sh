@@ -1,12 +1,25 @@
 #!/usr/bin/env bash
+set -euo pipefail
+
+target_file="${HOME}/.bashrc"
+timestamp="$(date +%Y%m%d%H%M%S)"
+
+if [[ -f "${target_file}" ]]; then
+  backup_file="${target_file}.bak.${timestamp}"
+  cp "${target_file}" "${backup_file}"
+  echo "Backed up ${target_file} to ${backup_file}"
+fi
+
+cat > "${target_file}" <<'FAE_BASHRC_EOF'
+#!/usr/bin/env bash
 # =============================================================================
-# fae_bashrc  (v0.4)  — the standardized FAE ~/.bashrc, input-only capture
+# fae_bashrc  (v0.41) — the standardized FAE ~/.bashrc, input-only capture
 #
-# FAE on-site shell environment for hospital production machines. This file IS
-# the machine's ~/.bashrc: deploy by REPLACING ~/.bashrc with it, so every FAE
-# machine runs one identical, unified shell environment.
+# FAE on-site shell environment for hospital production machines. This
+# installer backs up the current ~/.bashrc and installs the embedded FAE bashrc,
+# so every FAE machine runs one identical, unified shell environment.
 #
-#     cp fae_bashrc ~/.bashrc     # (back up the old one first if it matters)
+#     bash fae_bashrc.sh          # backs up and installs to ~/.bashrc
 #
 # v0.4 replaces v0.2/v0.3's whole-screen `script` recording with an INPUT-ONLY
 # capture model. The risk was that recording the whole pty wrote patient PHI
@@ -577,3 +590,6 @@ case "$PROMPT_COMMAND" in
     "")  PROMPT_COMMAND="history -a; _fae_log_cmd" ;;
     *)   PROMPT_COMMAND="history -a; _fae_log_cmd; ${PROMPT_COMMAND}" ;;
 esac
+FAE_BASHRC_EOF
+
+echo "Installed embedded FAE bashrc to ${target_file}"
