@@ -139,7 +139,7 @@ sq() {
     *) return 1 ;;
   esac
 }
-sec()  { printf '\n## %s\n\n' "$1"; }
+sec()  { printf '\n<!--SEC:%s-->\n## %s\n\n' "$1" "$2"; }
 kv()   { printf -- '- **%s**: %s\n' "$1" "$2"; }
 note() { printf -- '- _(略過:%s)_\n' "$1"; }
 # 只取單一鍵的值,不 source 整個 env 檔
@@ -220,6 +220,7 @@ fi
 # 報告不落地靠螢幕複製,所以要起訖標記;走 stderr 才不會混進 stdout。
 printf '\n===== 以下開始複製(到「以上結束複製」為止)=====\n\n' >&2
 
+printf '<!--COLLECTOR:v1.14-->\n'
 printf '# site config 採集結果 — %s(%s)\n' "$(hostname 2>/dev/null || echo unknown)" "$NODE_SELF"
 printf '> 唯讀採集。敏感值(帳密/私鑰)本腳本刻意不抓。\n'
 printf '> 採集權限:%s\n' "${SUDO_NOTE:-未判定}"
@@ -234,7 +235,7 @@ printf '> | 7 GPU node / AI Landing | `AUTO:M-machine` 末段「GPU node」 |\n'
 printf '> | 8 對接與整合設定 | `AUTO:M-config` 的「對接(整合)」 |\n'
 printf '> | 9 另一個節點 | 不直接貼:只是提醒對方節點是誰,那台自己跑一次的輸出才併進各表的 Node 2 欄 |\n'
 
-sec "0. 節點識別"
+sec node.identity "0. 節點識別"
 kv "hostname" "$(hostname 2>/dev/null || echo unknown)"
 kv "本機角色" "$ROLE"
 kv "架構 ARCHITECTURE" "${ARCH:-未知}"
@@ -254,7 +255,7 @@ if [ "$ARCH" = "dual" ]; then
 fi
 
 # ── 1. 節點與網路 ──────
-sec "1. 節點與網路"
+sec net "1. 節點與網路"
 # 自動判斷最可能的對外路徑:預設路由的介面就是主要對外網卡,不列整張路由表
 if have ip; then
   DEF_LINE="$(ip route show default 2>/dev/null | head -1)"
@@ -282,14 +283,14 @@ for _if in /sys/class/net/*; do
     IFLIST="$IFLIST $_n"
   fi
 done
-printf '### 網路介面(已濾掉容器與虛擬網卡)\n```\n'
+printf '<!--SEC:net.interfaces-->\n### 網路介面(已濾掉容器與虛擬網卡)\n```\n'
 if have ip; then
   for _n in $IFLIST; do ip -brief addr show "$_n" 2>/dev/null; done
 fi
 printf '```\n'
 # 只撈累積型欄位,不撈即時流量。speed / MTU 讀 sysfs(ethtool 要 CAP_NET_ADMIN),
 # 型號用 lspci 補 —— 只有驅動名看不出是 1G 還是 25G 卡。
-printf '### 介面明細(speed / MTU / 驅動 / 型號)\n'
+printf '<!--SEC:net.iface_detail-->\n### 介面明細(speed / MTU / 驅動 / 型號)\n'
 printf -- '> `br0` / `bond0` 這類虛擬介面的 speed 是聚合出來的虛擬值(實測 demo 機 `br0` 報 10000Mb/s,\n'
 printf -- '> 底下的實體卡其實只跑 1000Mb/s)。**要看實體那一列,不要看 bridge 那一列。**\n'
 printf '```\n'
@@ -338,7 +339,7 @@ if [ "$EMULATED_NIC_SEEN" = "1" ]; then
   printf -- '> (vmxnet3 / virtio_net)。吞吐與 CPU 開銷都明顯較差,通常是建 VM 時範本沒改或沒裝 VMware Tools。\n'
 fi
 # MTU 1500 vs 9000 對 NFS 大檔差很多。DOWN 的實體網卡不濾掉:「有 10G 埠沒接線」是擴充頻寬最便宜的路。
-printf '### 介面累積錯誤 / 丟包(自開機累積,非時點值)\n'
+printf '<!--SEC:net.iface_errors-->\n### 介面累積錯誤 / 丟包(自開機累積,非時點值)\n'
 printf -- '> **`rx_drop` 在 bridge 與實體卡上常態就有數字**(收到不是給本機的封包也算),\n'
 printf -- '> 實測 demo 機 `br0` 有 300 萬筆。**要看的是 `rx_err`/`tx_err`,那才代表線路或卡有問題。**\n'
 IFERR=""
@@ -354,7 +355,7 @@ done
 if [ -n "$IFERR" ]; then printf '```\n%s```\n' "$IFERR"; else printf -- '- 全部介面的 rx/tx errors 與 dropped 都是 0\n'; fi
 # bonding / VLAN:有沒有做鏈路聚合直接決定頻寬上限是一張卡還是兩張卡
 if [ -d /proc/net/bonding ] && ls /proc/net/bonding/* >/dev/null 2>&1; then
-  printf '### bonding\n```\n'
+  printf '<!--SEC:net.bonding-->\n### bonding\n```\n'
   for _b in /proc/net/bonding/*; do
     printf '[%s]\n' "$(basename "$_b")"
     grep -E 'Bonding Mode|Slave Interface|MII Status|Speed|Aggregator ID' "$_b" 2>/dev/null
@@ -364,17 +365,17 @@ else
   printf -- '- **bonding**: 無(沒有 `/proc/net/bonding`,單卡)\n'
 fi
 if [ -s /proc/net/vlan/config ]; then
-  printf '### VLAN\n```\n'; cat /proc/net/vlan/config 2>/dev/null; printf '```\n'
+  printf '<!--SEC:net.vlan-->\n### VLAN\n```\n'; cat /proc/net/vlan/config 2>/dev/null; printf '```\n'
 else
   printf -- '- **VLAN**: 無(guest 看不到 VLAN 標籤時這裡也會是「無」,交換器側要另外問)\n'
 fi
-printf '### DNS\n```\n'
+printf '<!--SEC:net.dns-->\n### DNS\n```\n'
 grep -E '^nameserver' /etc/resolv.conf 2>/dev/null || note "讀不到 resolv.conf"
 printf '```\n'
 # v1.2 起不列 listen port:抓到的幾乎都是 NFS/RPC 動態高位 port,是雜訊。對外 port 以防火牆為準。
 
 # ── 2. 憑證 ──
-sec "2. 憑證(SSL)"
+sec cert "2. 憑證(SSL)"
 CERT="$DEPLOY_DIR/data/ssl/cert.pem"
 # 「檔案不存在」與「存在但讀不到」要講不同的話:cert 常是 0600 root:root,`[ -f ]` 過得了但
 # openssl 讀不到 —— 舊版兩種都印「找不到」,權限問題會偽裝成「這站沒有憑證」。
@@ -413,7 +414,7 @@ else
 fi
 
 # ── 3. 硬體 ──────
-sec "3. 硬體"
+sec hw "3. 硬體"
 if have lscpu; then
   kv "CPU 型號" "$(lscpu 2>/dev/null | grep -E 'Model name' | sed 's/.*: *//')"
   kv "CPU 核心(邏輯)" "$(nproc 2>/dev/null)"
@@ -422,7 +423,7 @@ if have free; then kv "RAM" "$(free -h 2>/dev/null | awk '/^Mem:/{print $2}')"; 
 if have nvidia-smi; then
   kv "GPU driver / CUDA" "driver $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1) / $(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -1)"
 fi
-printf '### GPU\n```\n'
+printf '<!--SEC:hw.gpu-->\n### GPU\n```\n'
 if have nvidia-smi; then
   nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || nvidia-smi -L 2>/dev/null
 else note "無 nvidia-smi"; fi
@@ -445,7 +446,7 @@ else
 fi
 
 # ── 4. OS / Docker / 儲存 ──────
-sec "4. OS / Docker / 儲存"
+sec os "4. OS / Docker / 儲存"
 kv "OS" "$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
 kv "Kernel" "$(uname -r 2>/dev/null)"
 VIRT=""
@@ -472,7 +473,7 @@ printf '%s\n' "$HWCTL" | grep -qi 'RAID bus controller' && HW_CTL_RAID=1
 IMSM_SEEN=0   # 下面 md 段偵測到 Intel RST 時設 1;硬體 RAID 段要用(md 段在它前面)
 # 先回答「這台幾顆碟」。用 -P(key="value")而不是欄位對齊:MODEL 常含空白(PERC H730P Mini),
 # 欄位切割會把它切成兩欄、序號跟著跑位。
-printf '### 實體碟總覽\n'
+printf '<!--SEC:hw.disks-->\n### 實體碟總覽\n'
 DISKROWS=""
 # 這兩個旗標會傳到下面的「硬體 RAID」段用:碟的型號本身就是「這台的碟是誰做出來的」的線索。
 HW_RAID_HINT=0    # 型號看起來是 RAID 控制器做出來的 virtual disk
@@ -549,11 +550,11 @@ if have lsblk; then
 else
   note "無 lsblk,碟數與型號要人工查"
 fi
-printf '### 區塊裝置 / 分割\n```\n'
+printf '<!--SEC:storage.blockdev-->\n### 區塊裝置 / 分割\n```\n'
 # -e 7 濾掉 loop 裝置(snap 裝的 microk8s 實測 29 個 squashfs,會淹掉磁碟結構)。
 # 結尾 `| cat`:lsblk 依終端機寬度會截斷最後一欄,stdout 是 pipe 時才不截斷。
 if have lsblk; then lsblk -e 7 -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>/dev/null | cat; else note "無 lsblk"; fi
-printf '```\n### 磁碟使用 / mount\n```\n'
+printf '```\n<!--SEC:storage.mount-->\n### 磁碟使用 / mount\n```\n'
 if have df; then df -hT 2>/dev/null | grep -vE 'tmpfs|overlay|squashfs'; fi
 printf '```\n'
 # `df` 有但 `lsblk` 沒有的碟:裝置已不在 /sys/block(拔掉 / 掉出控制器 / 熱插拔沒重掛)但掛載還在。
@@ -576,7 +577,7 @@ if have lsblk && [ -r /proc/mounts ]; then
 fi
 # NFS 掛載參數:df 說「掛了誰、用多少」,這裡說「怎麼掛的」。rsize/wsize 與 vers 決定大檔吞吐,
 # hard vs soft 決定 NFS 卡住時是無限等待還是回錯。來源主機不重複列(上面 df 有)。
-printf '### NFS 掛載參數\n'
+printf '<!--SEC:storage.nfs_opts-->\n### NFS 掛載參數\n'
 # 只認 client 掛載:fstype 精確比對 nfs / nfs4(`^nfs` 會把 server 側的 /proc/fs/nfsd 也算進來)。
 NFSTBL="$(awk '$3 == "nfs" || $3 == "nfs4" {
     opts = $4
@@ -605,7 +606,7 @@ else
 fi
 # 一律印結論:舊版沒有 md 就整段不印,讀者分不出「沒有軟 RAID」與「腳本沒查」。
 # 而且只貼 mdstat 原文不夠:degraded 在 `[U_]` 那兩個字元,會被滑過去。
-printf '### 軟體 RAID(md)\n'
+printf '<!--SEC:hw.raid_md-->\n### 軟體 RAID(md)\n'
 if [ ! -r /proc/mdstat ]; then
   printf -- '- 讀不到 `/proc/mdstat`(kernel 沒有 md 模組)\n'
 elif ! grep -q '^md' /proc/mdstat 2>/dev/null; then
@@ -649,7 +650,7 @@ if have vgs; then
   if [ -z "$LVM_OUT" ] && sudo_ready; then
     LVM_OUT="$(sq vgs 2>/dev/null; sq lvs -o +segtype 2>/dev/null)"
   fi
-  printf '### LVM\n'
+  printf '<!--SEC:storage.lvm-->\n### LVM\n'
   if [ -n "$LVM_OUT" ]; then
     printf '```\n%s\n```\n' "$LVM_OUT"
   elif lsblk -o FSTYPE 2>/dev/null | grep -q LVM2_member; then
@@ -659,7 +660,7 @@ if have vgs; then
   fi
 fi
 # ZFS / btrfs:軟體 RAID 的另外兩種,只查 mdstat 會漏掉整片陣列。沿用 LVM 那套權限判斷。
-printf '### ZFS\n'
+printf '<!--SEC:storage.zfs-->\n### ZFS\n'
 if ! have zpool; then
   printf -- '- 無 ZFS(沒有 `zpool` 指令)\n'
 else
@@ -677,7 +678,7 @@ else
 fi
 # btrfs 只在真的有 btrfs 檔案系統時才查,避免在每台機器上多印一段無關的「無」
 if lsblk -o FSTYPE 2>/dev/null | grep -q btrfs; then
-  printf '### btrfs(偵測到 btrfs 檔案系統)\n'
+  printf '<!--SEC:storage.btrfs-->\n### btrfs(偵測到 btrfs 檔案系統)\n'
   if ! have btrfs; then
     note "有 btrfs 分割但沒有 btrfs 指令,RAID profile 抓不到"
   else
@@ -693,7 +694,7 @@ if lsblk -o FSTYPE 2>/dev/null | grep -q btrfs; then
 fi
 # 硬體 RAID 分兩層:① 控制器型號(lspci,非 root 可讀);② 陣列狀態(只有廠商 CLI 問得到,需 root)。
 # 兩層都拿不到時要明講量不到,不能讓「md 成員全部在線」被讀成「陣列沒問題」。
-printf '### 硬體 RAID(控制器)\n'
+printf '<!--SEC:hw.raid_ctrl-->\n### 硬體 RAID(控制器)\n'
 # HWCTL / HW_CTL_RAID 在「實體碟總覽」之前就算好了(見那裡的註解),這裡只負責印
 if ! have lspci; then
   note "無 lspci,控制器型號要人工查(BMC 或機器標籤)"
@@ -806,7 +807,7 @@ else
   fi
 fi
 # SMART 刻意只取整體判定:通電時數 / 重配置磁區 / 壽命% 屬監控指標,每顆碟一份也會淹掉報告。
-printf '### 硬碟健康(SMART,只取整體判定)\n'
+printf '<!--SEC:hw.smart-->\n### 硬碟健康(SMART,只取整體判定)\n'
 # VM 上這段不適用:虛擬碟沒有實體 SMART。而且**雲端沒有 BMC**,不能照抄「走 BMC」那句。
 IS_VM=0
 { [ -n "$VIRT" ] && [ "$VIRT" != "none" ]; } && IS_VM=1
@@ -857,7 +858,7 @@ else
 fi
 # 反過來:「這台把資料分享給誰」。samba 不屬於 aetherSlide(compose 沒有 SMB server),
 # 有的話一定是站台自建或客戶 IT 推的 —— 只列分享名與 path,不判斷用途,密碼類鍵不抓。
-printf '### 本機分享出去的目錄(samba)\n'
+printf '<!--SEC:share.samba-->\n### 本機分享出去的目錄(samba)\n'
 SMBCONF=/etc/samba/smb.conf
 if [ ! -f "$SMBCONF" ]; then
   printf -- '- 無 `%s`(本機沒裝 samba,或用其他方式分享)\n' "$SMBCONF"
@@ -889,7 +890,7 @@ else
 fi
 # 同一類的另一半:這台當 NFS server 分享出去的目錄。
 # `exportfs -s` 要 root,所以讀設定檔:/etc/exports 加 /etc/exports.d/*.exports。
-printf '### 本機分享出去的目錄(NFS export)\n'
+printf '<!--SEC:share.nfs_export-->\n### 本機分享出去的目錄(NFS export)\n'
 EXPFILES=""
 [ -f /etc/exports ] && EXPFILES="/etc/exports"
 for _e in /etc/exports.d/*.exports; do [ -f "$_e" ] && EXPFILES="$EXPFILES $_e"; done
@@ -920,7 +921,7 @@ fi
 
 # ── 5. 執行中的 aetherSlide ──────
 # 整節用 HAS_AS 包起來:AI 推論主機常沒有 aetherSlide,照印空欄位會像「裝了但全掛了」。
-sec "5. 執行中的 aetherSlide"
+sec app "5. 執行中的 aetherSlide"
 if [ "$HAS_AS" = "0" ]; then
   note "本機沒有 aetherSlide 部署($DEPLOY_DIR 找不到 configs.env / .env),本節略過"
   note "部署在別的路徑的話用第一個參數指定:bash collect_site_config.sh /path/to/website"
@@ -940,7 +941,7 @@ else
   kv "SITE_NAME(站台代號)" "$(envval "$DEPLOY_DIR/configs.env" SITE_NAME)"
   kv "MODULES(啟用的功能模組)" "$(envval "$DEPLOY_DIR/configs.env" MODULES)"
   kv "WEB_NETWORK_LOCATION(對外網址)" "$(envval "$DEPLOY_DIR/configs.env" WEB_NETWORK_LOCATION)"
-  printf '### 設定檔存在狀況\n'
+  printf '<!--SEC:app.config_files-->\n### 設定檔存在狀況\n'
   for f in configs.env prefs.env .env configs.yaml tier_configs.yaml model-config; do
     if [ -e "$DEPLOY_DIR/$f" ]; then kv "$f" "存在"; else kv "$f" "(無)"; fi
   done
@@ -949,7 +950,7 @@ else
   if have docker; then
     BAD="$(docker ps --format '{{.Names}}\t{{.Status}}' 2>/dev/null |
       grep -iE 'restarting|unhealthy|health: starting|created|paused')"
-    printf '### 狀態不正常的 container(先看這個)\n'
+    printf '<!--SEC:app.containers_unhealthy-->\n### 狀態不正常的 container(先看這個)\n'
     if [ -n "$BAD" ]; then
       printf '```\n%s\n```\n' "$BAD"
       printf -- '- _重啟中 / unhealthy 代表這個服務現在是壞的,交接時要問清楚原因_\n'
@@ -957,7 +958,7 @@ else
       printf -- '- 無狀態異常的 container\n'
     fi
   fi
-  printf '### 執行中 container(名稱 / image / 狀態 / 對外 port)\n```\n'
+  printf '<!--SEC:app.containers_running-->\n### 執行中 container(名稱 / image / 狀態 / 對外 port)\n```\n'
   if have docker; then
     docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || note "docker ps 失敗(權限?)"
   else note "無 docker"; fi
@@ -966,19 +967,19 @@ else
   if have docker; then
     STOPPED="$(docker ps -a --filter 'status=exited' --filter 'status=dead' \
       --format '{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null | head -15)"
-    printf '### 已停止的 container(Exited 0 多半是一次性初始化,非 0 才要追)\n'
+    printf '<!--SEC:app.containers_stopped-->\n### 已停止的 container(Exited 0 多半是一次性初始化,非 0 才要追)\n'
     if [ -n "$STOPPED" ]; then printf '```\n%s\n```\n' "$STOPPED"; else printf -- '- 無\n'; fi
   fi
 fi
 
 # ── 6. 時間與排程 ──────
-sec "6. 時間與排程"
+sec sched "6. 時間與排程"
 if have timedatectl; then
   kv "時區 / NTP" "$(timedatectl 2>/dev/null | tr -s ' ' | grep -E 'Time zone|NTP' | paste -sd '; ' -)"
 else
   kv "時間 / 時區" "$(date 2>/dev/null)"
 fi
-printf '### 使用者 crontab\n```\n'
+printf '<!--SEC:sched.crontab-->\n### 使用者 crontab\n```\n'
 crontab -l 2>/dev/null || printf '(無 crontab 或讀不到)\n'
 printf '```\n'
 if have systemctl; then
@@ -986,18 +987,18 @@ if have systemctl; then
   # smartd/mdmonitor/zed/multipathd(「碟壞了有沒有人被通知」跟「碟好不好」是兩件事)。
   UNITS="$(systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null \
     | grep -iE 'docker|compose|aetherslide|website|microk8s|kubelet|containerd|smbd|nmbd|winbind|nfs-server|smartd|mdmonitor|zed|multipathd' | awk '{print $1}')"
-  printf '### 相關 systemd service\n'
+  printf '<!--SEC:sched.services-->\n### 相關 systemd service\n'
   if [ -n "$UNITS" ]; then printf '```\n%s\n```\n' "$UNITS"; else printf -- '- 無(可能是人工 `bin/dc up` 起的)\n'; fi
   # 濾掉每台 Ubuntu 都有的 OS 預設 timer,只留這台自己加的
   TIMERS="$(systemctl list-timers --all --no-pager --no-legend 2>/dev/null \
     | grep -vE 'fwupd|man-db|logrotate|motd-news|dpkg-db-backup|systemd-tmpfiles|update-notifier|fstrim|sysstat|apt-daily|e2scrub|snapd|ua-timer|ubuntu-advantage|anacron|plocate|mlocate|apport')"
-  printf '### systemd timer(已濾掉 OS 預設,只留這台自己加的)\n'
+  printf '<!--SEC:sched.timers-->\n### systemd timer(已濾掉 OS 預設,只留這台自己加的)\n'
   if [ -n "$TIMERS" ]; then printf '```\n%s\n```\n' "$TIMERS"; else printf -- '- 無\n'; fi
 fi
 
 # ── 7. GPU node / AI Landing(AI 推論主機)──────
 # microk8s + helm,不是 docker compose,所以整段是另一套指令。不自動 SSH 過去。
-sec "7. GPU node / AI Landing(AI 推論)"
+sec ai "7. GPU node / AI Landing(AI 推論)"
 if [ "$HAS_AIL" = "0" ]; then
   note "本機沒有 AI Landing(找不到部署目錄的 values.yaml,也沒有 $AIL_NS namespace)"
   if [ -n "${AIL_URL:-}" ]; then
@@ -1026,7 +1027,7 @@ else
 
   # ── 版本:三個來源要並列 ──
   # helm appVersion(CI build 會變成 0.0.0-<sha>)、Chart.yaml、image tag 三者常不同,只抓一個會誤導。
-  printf '### 版本(三個來源,不一致是常態,要一起看)\n'
+  printf '<!--SEC:ai.versions-->\n### 版本(三個來源,不一致是常態,要一起看)\n'
   kv "Chart.yaml appVersion(部署目錄)" "$(yamlval "$AIL_DIR/charts/ai-landing/Chart.yaml" '^appVersion:')"
   if [ -n "$HELM" ]; then
     HELM_OUT="$($HELM list -A 2>/dev/null)"
@@ -1040,12 +1041,12 @@ else
   fi
   IMGS="$(kctl get deploy -n "$AIL_NS" -o 'custom-columns=NAME:.metadata.name,IMAGE:.spec.template.spec.containers[*].image' --no-headers)"
   if [ -n "$IMGS" ]; then
-    printf '### 核心服務 image(實際在跑的版本)\n```\n%s\n```\n' "$IMGS"
+    printf '<!--SEC:ai.core_images-->\n### 核心服務 image(實際在跑的版本)\n```\n%s\n```\n' "$IMGS"
   fi
 
   # ── values.yaml:逐鍵取值,密碼類鍵一律不查(同 configs.env 的原則)──
   if [ -f "$AIL_DIR/values.yaml" ]; then
-    printf '### values.yaml(非密鍵;adminPassword / SECRET_KEY / *_PASS 刻意不抓)\n'
+    printf '<!--SEC:ai.values-->\n### values.yaml(非密鍵;adminPassword / SECRET_KEY / *_PASS 刻意不抓)\n'
     kv "external_ip" "$(yamlval "$AIL_DIR/values.yaml" '^external_ip:')"
     kv "port" "$(yamlval "$AIL_DIR/values.yaml" '^port:')"
     kv "image registry" "$(yamlval "$AIL_DIR/values.yaml" '^[[:space:]]+host:')/$(yamlval "$AIL_DIR/values.yaml" '^[[:space:]]+repository:')"
@@ -1064,20 +1065,20 @@ else
   # ── 對外端點 ──
   # 8500 是 svc/ingress 的 externalIPs,由 kube-proxy iptables 轉;主機上沒有 listening socket。
   if [ -n "$KCTL" ]; then
-    printf '### 對外端點(externalIPs 沒有 listening socket,ss 抓不到,只能問 k8s)\n'
+    printf '<!--SEC:ai.endpoint-->\n### 對外端點(externalIPs 沒有 listening socket,ss 抓不到,只能問 k8s)\n'
     ING_SVC="$(kctl get svc -A --no-headers -o 'custom-columns=NS:.metadata.namespace,NAME:.metadata.name,TYPE:.spec.type,EXTIP:.spec.externalIPs[*],PORT:.spec.ports[*].port' | awk '$4!="<none>"')"
     if [ -n "$ING_SVC" ]; then printf '```\n%s\n```\n' "$ING_SVC"; else note "沒有帶 externalIPs 的 service"; fi
     NP_SVC="$(kctl get svc -A --no-headers -o 'custom-columns=NS:.metadata.namespace,NAME:.metadata.name,TYPE:.spec.type,NODEPORT:.spec.ports[*].nodePort' | awk '$3=="NodePort"')"
-    printf '#### NodePort service\n'
+    printf '<!--SEC:ai.endpoint.nodeport-->\n#### NodePort service\n'
     if [ -n "$NP_SVC" ]; then printf '```\n%s\n```\n' "$NP_SVC"; else printf -- '- 無\n'; fi
     ING="$(kctl get ingress -A --no-headers)"
-    printf '#### Ingress\n'
+    printf '<!--SEC:ai.endpoint.ingress-->\n#### Ingress\n'
     if [ -n "$ING" ]; then printf '```\n%s\n```\n' "$ING"; else printf -- '- 無\n'; fi
   fi
 
   # ── 叢集節點與 GPU 配置 ──
   if [ -n "$KCTL" ]; then
-    printf '### 叢集節點\n```\n'
+    printf '<!--SEC:ai.nodes-->\n### 叢集節點\n```\n'
     kctl get nodes --no-headers -o 'custom-columns=NAME:.metadata.name,ROLES:.metadata.labels.node-role,VER:.status.nodeInfo.kubeletVersion,IP:.status.addresses[0].address,GPU:.status.capacity.nvidia\.com/gpu,RUNTIME:.status.nodeInfo.containerRuntimeVersion'
     printf '```\n'
     NODE_N="$(kctl get nodes --no-headers | wc -l | tr -d ' ')"
@@ -1088,7 +1089,7 @@ else
     kv "實體 GPU 數(nvidia-smi)" "${PHYS_GPU:-0}"
     kv "k8s 可配置 GPU 數(capacity)" "${K8S_GPU:-0}(大於實體數 = time-slicing 有開)"
     TS="$(kctl get cm -A --no-headers | grep -i time-slicing)"
-    printf '#### time-slicing configmap\n'
+    printf '<!--SEC:ai.timeslicing-->\n#### time-slicing configmap\n'
     if [ -n "$TS" ]; then printf '```\n%s\n```\n' "$TS"; else printf -- '- 無(未設定 time-slicing)\n'; fi
   fi
 
@@ -1097,17 +1098,17 @@ else
   if [ -n "$KCTL" ]; then
     PODS="$(kctl get pods -n "$AIL_NS" --no-headers -o 'custom-columns=OWNER:.metadata.ownerReferences[*].kind,NAME:.metadata.name,PHASE:.status.phase,REASON:.status.reason,READY:.status.containerStatuses[*].ready,RESTARTS:.status.containerStatuses[*].restartCount')"
     CORE="$(printf '%s\n' "$PODS" | awk '$1!="Job"')"
-    printf '### 核心 pod(已排除推論 job 的 pod)\n'
+    printf '<!--SEC:ai.pods-->\n### 核心 pod(已排除推論 job 的 pod)\n'
     if [ -n "$CORE" ]; then printf '```\n%s\n```\n' "$CORE"; else note "查不到 pod"; fi
     BADP="$(printf '%s\n' "$CORE" | awk '$3!="Running" && $3!="Succeeded" || $5 ~ /false/')"
-    printf '#### 狀態不正常的核心 pod(先看這個)\n'
+    printf '<!--SEC:ai.pods_unhealthy-->\n#### 狀態不正常的核心 pod(先看這個)\n'
     if [ -n "$BADP" ]; then
       printf '```\n%s\n```\n' "$BADP"
       printf -- '- _交接時要問清楚原因_\n'
     else
       printf -- '- 無\n'
     fi
-    printf '#### 推論 job 統計(受 BACKEND_JOB_TTL_DAYS_AFTER_FINISHED 限制,只看得到保留期內的)\n'
+    printf '<!--SEC:ai.jobs_stats-->\n#### 推論 job 統計(受 BACKEND_JOB_TTL_DAYS_AFTER_FINISHED 限制,只看得到保留期內的)\n'
     JOB_N="$(kctl get jobs -n "$AIL_NS" --no-headers | wc -l | tr -d ' ')"
     kv "job 總數" "${JOB_N:-0}"
     printf '```\n%s\n```\n' "$(printf '%s\n' "$PODS" | awk '$1=="Job"{print $3" "$4}' | sort | uniq -c | sort -rn)"
@@ -1116,7 +1117,7 @@ else
     ALL_IMG="$(kctl get pods -n "$AIL_NS" --no-headers -o 'custom-columns=IMG:.spec.containers[*].image' |
       tr ',' '\n' | sed 's/^ *//' | grep -v '^$')"
     APP_IMG="$(printf '%s\n' "$ALL_IMG" | grep '/ai-app/' | sort | uniq -c | sort -rn)"
-    printf '#### 保留期內跑過的 AI app image(次數 / image)\n'
+    printf '<!--SEC:ai.app_images-->\n#### 保留期內跑過的 AI app image(次數 / image)\n'
     if [ -n "$APP_IMG" ]; then
       printf '```\n%s\n```\n' "$APP_IMG"
     else
@@ -1124,7 +1125,7 @@ else
       printf '```\n%s\n```\n' "$(printf '%s\n' "$ALL_IMG" | sort | uniq -c | sort -rn)"
     fi
     printf -- '_這是「跑過」不是「裝了哪些」;沒被呼叫過的 app 不會出現_\n'
-    printf '### PVC\n```\n'
+    printf '<!--SEC:ai.pvc-->\n### PVC\n```\n'
     kctl get pvc -n "$AIL_NS" --no-headers
     printf '```\n'
   fi
@@ -1144,7 +1145,7 @@ fi
 
 # ── 8. 對接與整合設定(從 configs.env 讀,不含任何密碼類鍵)──────
 # 屬 M-config 層,貼到站頁的「對接(整合)」。
-sec "8. 對接與整合設定(→ 貼到 M-config 的「對接(整合)」)"
+sec integ "8. 對接與整合設定(→ 貼到 M-config 的「對接(整合)」)"
 # DICOM / HL7 等鍵沒用到也有預設值:模組沒列在 MODULES 裡就代表服務沒起、設定不生效。
 MODULES_VAL="$(envval "$DEPLOY_DIR/configs.env" MODULES | tr -d ' ')"
 mod_off() {   # 模組不在 MODULES 裡就回傳提示字串
@@ -1174,7 +1175,7 @@ fi
 # ── 9. 另一個節點(dual)──────
 # 只提醒「有另一台、是哪一台」:不自動連過去,跑法也不印在報告裡(要指令就用 --peer)。
 if [ "$ARCH" = "dual" ]; then
-  sec "9. 另一個節點"
+  sec peer "9. 另一個節點"
   if [ -n "$PEER_IP" ]; then
     kv "對方節點" "$PEER_IP$([ -n "$NODE_SELF" ] && printf '(本機是 %s)' "$NODE_SELF")"
     printf -- '- 那一台要自己再跑一次;要指令就跑 `bash %s --peer <帳號>@%s`(只印指令,不會採本機)\n' \
