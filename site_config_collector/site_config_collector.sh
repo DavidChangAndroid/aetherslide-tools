@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# collect_site_config.sh v1.15 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 site config 站頁。
+# collect_site_config.sh v1.16 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 site config 站頁。
 # 2026-08-07 起**報告輸出全部英文**(國外 FAE 也要用);shell 註解仍保持中文(給維護者看)。
 #
 # 常態用法(零參數):
@@ -31,7 +31,7 @@ while [ $# -gt 0 ]; do
       [ -n "$PEER" ] || { echo "--peer requires [user@]host" >&2; exit 2; }
       shift 2 ;;
     -h|--help)
-      printf '%s v1.15 — read-only capture of a customer site environment; prints Markdown to paste into the site config page.\n\n' "$SCRIPT_NAME"
+      printf '%s v1.16 — read-only capture of a customer site environment; prints Markdown to paste into the site config page.\n\n' "$SCRIPT_NAME"
       printf '  bash %s [deploy-dir]            defaults to ~/website. The report is printed to the screen, no file is written\n' "$SCRIPT_NAME"
       printf '  bash %s --peer [user@]host      only prints the command to run this script on that host, then exits; does not capture this host\n' "$SCRIPT_NAME"
       printf '  bash %s --ai-landing-dir DIR    set this when AI Landing is not auto-detected\n\n' "$SCRIPT_NAME"
@@ -221,10 +221,12 @@ fi
 # 報告不落地靠螢幕複製,所以要起訖標記;走 stderr 才不會混進 stdout。
 printf '\n===== COPY FROM HERE (down to "END OF COPY") =====\n\n' >&2
 
-printf '<!--COLLECTOR:v1.15-->\n'
+printf '<!--COLLECTOR:v1.16-->\n'
 printf '# site config capture — %s(%s)\n' "$(hostname 2>/dev/null || echo unknown)" "$NODE_SELF"
 printf '> Read-only capture. Sensitive values (credentials / private keys) are deliberately not collected.\n'
 printf '> Privilege: %s\n' "${SUDO_NOTE:-not determined}"
+# 採集時間是目標機自己的時鐘與時區(第 6 段有時區/NTP,對得起來就知道這個時間可不可信)。
+printf '> Captured at: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo unknown)"
 printf '>\n'
 printf '> **Where to paste this** (the section order already matches the site page; paste top to bottom):\n'
 printf '>\n'
