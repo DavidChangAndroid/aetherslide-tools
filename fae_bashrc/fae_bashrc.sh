@@ -1,9 +1,141 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =============================================================================
+# fae_bashrc installer (v0.5)
+#
+#     bash fae_bashrc.sh          # backs up, migrates customizations, installs
+#
+# fae_bashrc OWNS ~/.bashrc: it is replaced wholesale so every FAE machine runs
+# one identical shell environment. v0.5 adds the missing half of that deal — the
+# FAE's OWN customizations (aliases, PATH, conda/nvm init) move to
+# ~/.bashrc.local, which the installed bashrc sources on every interactive
+# login and which upgrades never overwrite.
+#
+# This installer migrates a pre-existing ~/.bashrc into ~/.bashrc.local by
+# default, commenting out only the lines that would silently break command/edit
+# capture (and reporting each one).
+# =============================================================================
+
 target_file="${HOME}/.bashrc"
+user_rc="${HOME}/.bashrc.local"
 timestamp="$(date +%Y%m%d%H%M%S)"
 
+# Names whose capture wrappers an alias would silently shadow. bash resolves
+# alias -> keyword -> function, and alias expansion happens at parse time, so a
+# same-named alias wins no matter what order things are defined in. Keep this
+# list in sync with _FAE_PROTECTED_NAMES in the embedded bashrc below.
+protected_re='vi|vim|nano|crontab|su|sudo|ssh|docker|ssh-copy-id'
+
+# --- Is $1 a bashrc that this tool installed? --------------------------------
+# v0.5+ carries an explicit marker line. v0.4/v0.41 predate the marker, so fall
+# back to a function name only our bashrc can contain.
+_is_fae_bashrc() {
+  [[ -f "$1" ]] || return 1
+  if grep -q '^# fae_bashrc-managed ' "$1" 2>/dev/null; then return 0; fi
+  if grep -q '_fae_log_cmd' "$1" 2>/dev/null; then return 0; fi
+  return 1
+}
+
+# -----------------------------------------------------------------------------
+# 1. Pick the migration source
+#
+# On a machine that ALREADY runs v0.4/v0.41, the current ~/.bashrc is ours —
+# migrating from it would copy fae's own wrappers into ~/.bashrc.local and then
+# source them recursively. The FAE's real content is in the OLDEST backup
+# (.bak.<ts>, so lexicographic order == chronological order).
+# -----------------------------------------------------------------------------
+migrate_from=""
+migrate_note=""
+if [[ ! -s "${target_file}" ]]; then
+  migrate_note="no existing ~/.bashrc"
+elif ! _is_fae_bashrc "${target_file}"; then
+  migrate_from="${target_file}"
+  migrate_note="current ~/.bashrc"
+else
+  oldest="$(ls -1 "${target_file}".bak.* 2>/dev/null | sort | head -1 || true)"
+  if [[ -n "${oldest}" && -s "${oldest}" ]] && ! _is_fae_bashrc "${oldest}"; then
+    migrate_from="${oldest}"
+    migrate_note="oldest backup ${oldest##*/} (current ~/.bashrc is already fae-managed)"
+  else
+    migrate_note="current ~/.bashrc is already fae-managed and no original backup was found — not guessing"
+  fi
+fi
+
+# -----------------------------------------------------------------------------
+# 2. Copy the source verbatim, commenting out only the dangerous lines
+#
+# Verbatim + selective disable, NOT a whitelist: a whitelist of `alias` /
+# `export PATH` lines would drop functions, `source` lines and conda/nvm init
+# blocks. PS1 is deliberately NOT disabled — the bashrc loads ~/.bashrc.local
+# after setting PS1, so a custom prompt is meant to win.
+# -----------------------------------------------------------------------------
+migrate_body=""
+disabled_report=()
+if [[ -n "${migrate_from}" ]]; then
+  lineno=0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    lineno=$((lineno + 1))
+    reason=""
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    if [[ -n "${trimmed}" && "${trimmed}" != '#'* ]]; then
+      if [[ "${trimmed}" =~ ^(export[[:space:]]+)?(HISTCONTROL|HISTSIZE|HISTFILESIZE|HISTTIMEFORMAT|HISTFILE)= ]]; then
+        reason="history settings are pinned by fae_bashrc for audit completeness"
+      elif [[ "${trimmed}" =~ ^(export[[:space:]]+)?PROMPT_COMMAND= ]]; then
+        reason="PROMPT_COMMAND is owned by fae_bashrc (command capture)"
+      elif [[ "${trimmed}" =~ ^trap[[:space:]] && "${trimmed}" == *EXIT* ]]; then
+        reason="an EXIT trap would replace fae_bashrc's session finalize"
+      elif [[ "${trimmed}" =~ ^alias[[:space:]]+(${protected_re})= ]]; then
+        reason="this alias would silently shadow a capture wrapper"
+      elif [[ "${trimmed}" =~ (^|[[:space:]])(\.|source)[[:space:]] ]] \
+        && [[ "${trimmed}" =~ \.bashrc(\.local)?([[:space:]]|$) ]]; then
+        reason="sourcing ~/.bashrc(.local) from here would recurse"
+      fi
+    fi
+    if [[ -n "${reason}" ]]; then
+      migrate_body+="# [fae v0.5 disabled] ${reason}"$'\n'"# ${line}"$'\n'
+      disabled_report+=("line ${lineno}: ${reason}")
+    else
+      migrate_body+="${line}"$'\n'
+    fi
+  done < "${migrate_from}"
+fi
+
+# -----------------------------------------------------------------------------
+# 3. Write ~/.bashrc.local — never over an existing one
+#
+# An existing ~/.bashrc.local means either a second install, or an old ~/.bashrc
+# that already sourced it. Either way the file is the FAE's; write beside it and
+# let them merge.
+# -----------------------------------------------------------------------------
+user_rc_written=""
+if [[ -n "${migrate_from}" ]]; then
+  if [[ -e "${user_rc}" ]]; then
+    user_rc_written="${user_rc}.migrated.${timestamp}"
+  else
+    user_rc_written="${user_rc}"
+  fi
+  {
+    echo "# ~/.bashrc.local — your own shell customizations (aliases, PATH, conda/nvm)."
+    echo "#"
+    echo "# Migrated from ${migrate_from}"
+    echo "# by fae_bashrc v0.5 on $(date '+%F %T')."
+    echo "#"
+    echo "# fae_bashrc sources this file on every interactive login and NEVER rewrites"
+    echo "# it again — it is yours. Upgrading fae_bashrc will not touch it."
+    echo "#"
+    echo "# Lines marked '[fae v0.5 disabled]' were commented out because they would"
+    echo "# break command/edit capture. Re-enabling them is at your own risk: the"
+    echo "# bashrc re-pins history settings and restores capture wrappers after"
+    echo "# sourcing this file anyway, so most of them simply cannot take effect."
+    echo ""
+    printf '%s' "${migrate_body}"
+  } > "${user_rc_written}"
+fi
+
+# -----------------------------------------------------------------------------
+# 4. Back up and install
+# -----------------------------------------------------------------------------
 if [[ -f "${target_file}" ]]; then
   backup_file="${target_file}.bak.${timestamp}"
   cp "${target_file}" "${backup_file}"
@@ -12,16 +144,17 @@ fi
 
 cat > "${target_file}" <<'FAE_BASHRC_EOF'
 #!/usr/bin/env bash
+# fae_bashrc-managed v0.5
 # =============================================================================
-# fae_bashrc  (v0.41) — the standardized FAE ~/.bashrc, input-only capture
+# fae_bashrc  (v0.5) — the standardized FAE ~/.bashrc, input-only capture
 #
-# FAE on-site shell environment for hospital production machines. This
-# installer backs up the current ~/.bashrc and installs the embedded FAE bashrc,
-# so every FAE machine runs one identical, unified shell environment.
+# FAE on-site shell environment for hospital production machines. The installer
+# backs up the current ~/.bashrc and installs this file in its place, so every
+# FAE machine runs one identical, unified shell environment.
 #
-#     bash fae_bashrc.sh          # backs up and installs to ~/.bashrc
+#     bash fae_bashrc.sh          # backs up, migrates customizations, installs
 #
-# v0.4 replaces v0.2/v0.3's whole-screen `script` recording with an INPUT-ONLY
+# v0.4 replaced v0.2/v0.3's whole-screen `script` recording with an INPUT-ONLY
 # capture model. The risk was that recording the whole pty wrote patient PHI
 # (names, MRNs, DOBs printed on screen) into the logs. v0.4 records only what
 # the FAE *did*, never what the screen *showed*:
@@ -36,8 +169,21 @@ cat > "${target_file}" <<'FAE_BASHRC_EOF'
 # command themselves (e.g. `grep <MRN>`) — small, and accepted as risk. See the
 # README "隱私定位" section; an MRN is a direct identifier, not "non-PII".
 #
+# v0.5 adds user customizations WITHOUT giving up "one file, every machine":
+# this file owns ~/.bashrc, and the FAE's own aliases/PATH/conda init live in
+# ~/.bashrc.local, sourced on every interactive login. Because a user alias
+# would silently shadow a capture wrapper (bash resolves alias before function,
+# regardless of definition order), the load is followed by a hardening pass that
+# un-aliases the protected names, restores overridden wrappers, and re-pins the
+# history settings — announcing each conflict instead of failing quietly.
+#
+# v0.5 also fixes a v0.4/v0.41 capture bug found while testing it: on a machine
+# whose audit history file was still empty, the FIRST command of the FIRST
+# session was swallowed by _fae_log_cmd's baseline. See that function.
+#
 # Design rationale & decisions:
-#   context/99-latest-v0.4-input-only-擷取模型-spec.md
+#   context/99-latest-v0.4-input-only-擷取模型-spec.md   (capture model)
+#   context/99-latest-v0.5-使用者自訂-bashrc-local-spec.md (this version)
 #
 # Capture seams (reuse the proven v0.3 machinery, just change the OUTPUT sink):
 #   - Commands: a PROMPT_COMMAND hook appends the last history entry to
@@ -47,7 +193,8 @@ cat > "${target_file}" <<'FAE_BASHRC_EOF'
 #     instead of echoing to a `script` recording.
 #   - Boundary crossing (ssh/su/sudo/docker): inject a bootstrap that sets the
 #     same two logs up on the far side, then collect them back to the
-#     originating machine's session dir.
+#     originating machine's session dir. The injected payload carries the
+#     CAPTURE only — never the user's ~/.bashrc.local.
 #
 # Compat: bash >= 4.3, Linux production hosts. Comments in English.
 # =============================================================================
@@ -64,6 +211,8 @@ case $- in *i*) ;; *) return ;; esac
 #   $FAE_HOME/logs/     per-session commands.log / edits.log + manifest
 #   $FAE_HOME/backups/  pre-edit file backups
 #   $FAE_HOME/history/  the audit history file (see [12] below)
+# ~/.bashrc.local is the deliberate exception: it is the FAE's own file, not
+# tool-owned state, so it stays where a FAE would look for it.
 : "${FAE_HOME:=$HOME/.fae}"                 # single root for all tool-owned state
 : "${FAE_LOG_DIR:=$FAE_HOME/logs}"          # session logs + manifest live here
 : "${FAE_BACKUP_DIR:=$FAE_HOME/backups}"    # pre-edit file backups
@@ -94,6 +243,8 @@ shopt -s histappend 2>/dev/null
 #   - ssh / docker : a fresh dir under the far side's /tmp (collected back on exit)
 #   - su / sudo    : the SAME local session dir (root can write it; no collection)
 # Output lands in that dir's commands.log / edits.log — never on any screen.
+# The user's ~/.bashrc.local is NOT carried across: ssh lands on a machine with
+# its own, and su/sudo land in root's HOME.
 # =============================================================================
 read -r -d '' _FAE_REMOTE_PAYLOAD << 'REMOTE_EOF'
 # --- fae_bashrc injected bootstrap (input-only capture) ---
@@ -112,10 +263,15 @@ _fae_log_cmd() {
     [[ -n "$FAE_SESSION_DIR" && -d "$FAE_SESSION_DIR" ]] || return 0
     local num cmd
     read -r num cmd <<< "$(HISTTIMEFORMAT='' builtin history 1 2>/dev/null)"
-    [[ -z "$num" ]] && return 0
     # First fire in THIS shell only records a baseline (skips any pre-existing
     # history entry) so injected ssh/su/docker shells never log a stale command.
-    if [[ -z "$_fae_seeded" ]]; then _fae_seeded=1; _fae_last_histn="$num"; return 0; fi
+    # An EMPTY history counts as a baseline of 0 — it must be seeded HERE, before
+    # the empty-num guard below. Otherwise, on a machine whose audit history file
+    # is still empty, the first prompt returns early WITHOUT seeding and the
+    # baseline lands on the session's first real command, swallowing it (v0.4/v0.41
+    # behaviour, fixed in v0.5).
+    if [[ -z "$_fae_seeded" ]]; then _fae_seeded=1; _fae_last_histn="${num:-0}"; return 0; fi
+    [[ -z "$num" ]] && return 0
     [[ "$num" == "$_fae_last_histn" ]] && return 0   # bare Enter → no new command
     _fae_last_histn="$num"
     { printf '%s  %s\n' "$(date '+%F %T' 2>/dev/null)" "$cmd" >> "$FAE_SESSION_DIR/commands.log"; } 2>/dev/null
@@ -223,8 +379,10 @@ _fae_log_cmd() {
     [[ -n "$FAE_SESSION_DIR" && -d "$FAE_SESSION_DIR" ]] || return 0
     local num cmd
     read -r num cmd <<< "$(HISTTIMEFORMAT='' builtin history 1 2>/dev/null)"
+    # Seed the baseline even on an empty history — see the twin in the injected
+    # payload above for why the order of these two lines matters.
+    if [[ -z "$_fae_seeded" ]]; then _fae_seeded=1; _fae_last_histn="${num:-0}"; return 0; fi
     [[ -z "$num" ]] && return 0
-    if [[ -z "$_fae_seeded" ]]; then _fae_seeded=1; _fae_last_histn="$num"; return 0; fi
     [[ "$num" == "$_fae_last_histn" ]] && return 0
     _fae_last_histn="$num"
     { printf '%s  %s\n' "$(date '+%F %T' 2>/dev/null)" "$cmd" >> "$FAE_SESSION_DIR/commands.log"; } 2>/dev/null
@@ -443,6 +601,120 @@ _fae_docker_collect() {
 }
 
 # =============================================================================
+# User customizations (~/.bashrc.local) + capture hardening
+#
+# This file owns ~/.bashrc, so the FAE's own aliases/PATH/conda init go in
+# ~/.bashrc.local. The installer migrates a pre-existing ~/.bashrc there once;
+# after that the file belongs to the FAE and this tool never rewrites it (it is
+# not backed up and not rotated either).
+#
+# Hardening exists because bash resolves names alias -> keyword -> function and
+# expands aliases at PARSE time: `alias vi='vim -u NONE'` beats the vi() capture
+# wrapper no matter which is defined first, and the failure is SILENT (edits.log
+# just stays empty). Defining the wrappers later does not help — the only fix is
+# to unalias. Same story for a same-named function, which replaces the wrapper
+# outright, so we snapshot the wrappers before sourcing and restore them after.
+#
+# Who wins what, by design:
+#   PS1             user  (loaded after PS1 is set — a custom prompt is fine)
+#   PROMPT_COMMAND  both  (the block at the bottom prepends _fae_log_cmd)
+#   HIST* / HISTFILE  fae (audit completeness)
+#   trap EXIT       fae   (the session trap is installed after this point)
+#   protected names fae   (aliases dropped, wrappers restored, both announced)
+# =============================================================================
+_FAE_PROTECTED_NAMES='vi vim nano crontab su sudo ssh docker ssh-copy-id'
+_fae_userrc_note=""      # held until the session dir exists, then written to manifest
+
+# Snapshot the capture wrappers so an override can be restored after sourcing.
+# Plain variables via printf -v (not an associative array) to stay compatible.
+_fae_snapshot_wrappers() {
+    local n v
+    for n in $_FAE_PROTECTED_NAMES; do
+        v="_fae_fnsnap_${n//[^A-Za-z0-9]/_}"
+        printf -v "$v" '%s' "$(declare -f "$n" 2>/dev/null)"
+    done
+}
+
+# Syntax-check, then source. A broken user file must not take the login down:
+# login is normally silent, so a raw pile of bash errors would be hard to trace.
+_fae_source_guarded() {
+    local f="$1" lines fp selfsrc
+    [[ -f "$f" ]] || return 0
+    if ! bash -n "$f" 2>/dev/null; then
+        printf 'fae: %s has a syntax error — not loaded (fix it, or run: bash -n %s)\n' "$f" "$f" >&2
+        _fae_userrc_note="${_fae_userrc_note}${_fae_userrc_note:+; }SKIPPED ${f##*/} (syntax error)"
+        return 0
+    fi
+    # A file that sources ~/.bashrc(.local) recurses until bash dies (SIGSEGV).
+    # No variable guard can stop it — the `.` builtin re-reads the file directly,
+    # bypassing this loader entirely — so the only defence is to refuse. The
+    # installer comments such lines out on migration; this catches a hand-edited
+    # file. An unloaded customization file beats an unusable login shell.
+    selfsrc="$(sed 's/#.*//' "$f" 2>/dev/null | grep -nE '(^|[[:space:]])(\.|source)[[:space:]]+[^;&|]*\.bashrc(\.local)?([[:space:]]|$)' 2>/dev/null | head -1)"
+    if [[ -n "$selfsrc" ]]; then
+        printf 'fae: %s sources ~/.bashrc(.local) at line %s — not loaded (it would recurse until the shell dies). Delete that line.\n' "$f" "${selfsrc%%:*}" >&2
+        _fae_userrc_note="${_fae_userrc_note}${_fae_userrc_note:+; }SKIPPED ${f##*/} (self-source at line ${selfsrc%%:*})"
+        return 0
+    fi
+    source "$f"
+    lines="$(wc -l < "$f" 2>/dev/null | tr -d ' ')"
+    fp="$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; } | cut -c1-8 )"
+    _fae_userrc_note="${_fae_userrc_note}${_fae_userrc_note:+; }loaded ${f##*/} (${lines:-0} lines, sha256 ${fp:-unknown})"
+}
+
+# _FAE_USER_RC_LOADED is deliberately NOT exported: every interactive shell
+# should load the customizations, but a user file that sources ~/.bashrc back
+# must not re-enter this loader within one shell. (A file that sources ITSELF
+# bypasses this guard entirely — see the self-source check in
+# _fae_source_guarded, which is the defence for that case.)
+_fae_load_user_rc() {
+    [[ -z "$_FAE_USER_RC_LOADED" ]] || return 0
+    _FAE_USER_RC_LOADED=1
+    _fae_source_guarded "$HOME/.bashrc.local"
+    # Reserved interface for future multi-source customization (personal +
+    # per-site). Undocumented on purpose: v0.5 ships one file.
+    if [[ -d "$FAE_HOME/bashrc.d" ]]; then
+        local d
+        for d in "$FAE_HOME"/bashrc.d/*.sh; do
+            [[ -f "$d" ]] && _fae_source_guarded "$d"
+        done
+    fi
+}
+
+# Undo anything the user file did that would silently disable capture. Only
+# reached when FAE_CAPTURE=1 — with capture off there is nothing to protect.
+_fae_harden_capture() {
+    local n v snap conflicts="" repinned=""
+
+    for n in $_FAE_PROTECTED_NAMES; do
+        if alias "$n" >/dev/null 2>&1; then
+            unalias "$n" 2>/dev/null
+            printf 'fae: dropped your alias for `%s` — it would silently break capture\n' "$n" >&2
+            conflicts="${conflicts}${conflicts:+, }alias:$n"
+        fi
+        v="_fae_fnsnap_${n//[^A-Za-z0-9]/_}"; snap="${!v}"
+        if [[ -n "$snap" && "$(declare -f "$n" 2>/dev/null)" != "$snap" ]]; then
+            eval "$snap"
+            printf 'fae: restored the `%s` capture wrapper (your override was dropped)\n' "$n" >&2
+            conflicts="${conflicts}${conflicts:+, }func:$n"
+        fi
+    done
+
+    # History settings are the audit trail — fae owns them unconditionally.
+    [[ "$HISTFILE" == "$FAE_HIST_DIR/bash_history" ]] || { HISTFILE="$FAE_HIST_DIR/bash_history"; repinned="${repinned}${repinned:+, }HISTFILE"; }
+    [[ "$HISTSIZE" == -1 ]]                           || { HISTSIZE=-1;                          repinned="${repinned}${repinned:+, }HISTSIZE"; }
+    [[ "$HISTFILESIZE" == -1 ]]                       || { HISTFILESIZE=-1;                      repinned="${repinned}${repinned:+, }HISTFILESIZE"; }
+    [[ -z "$HISTCONTROL" ]]                           || { HISTCONTROL=;                         repinned="${repinned}${repinned:+, }HISTCONTROL"; }
+    [[ "$HISTTIMEFORMAT" == "%F %T " ]]               || { HISTTIMEFORMAT="%F %T ";              repinned="${repinned}${repinned:+, }HISTTIMEFORMAT"; }
+    if [[ -n "$repinned" ]]; then
+        printf 'fae: re-pinned history settings owned by fae_bashrc: %s\n' "$repinned" >&2
+        conflicts="${conflicts}${conflicts:+; }repinned: $repinned"
+    fi
+
+    [[ -z "$conflicts" ]] || _fae_userrc_note="${_fae_userrc_note}${_fae_userrc_note:+; }${conflicts}"
+}
+
+# =============================================================================
 # Log-lifecycle engine
 #
 #   $FAE_LOG_DIR/session_<ts>_<tty>/
@@ -534,7 +806,8 @@ _fae_rotate() {
 _fae_housekeeping() { _fae_finalize_orphans; _fae_rotate; }
 
 # =============================================================================
-# Interactive setup: dirs, history, prompt, housekeeping, session start
+# Interactive setup: dirs, history, prompt, user customizations, housekeeping,
+# session start
 # (reached only in interactive shells — see the early return at the top)
 # =============================================================================
 mkdir -p "$FAE_LOG_DIR" "$FAE_BACKUP_DIR" "$FAE_HIST_DIR" 2>/dev/null
@@ -545,6 +818,13 @@ HISTFILE="$FAE_HIST_DIR/bash_history"
 
 # [1] Prompt — plain \u@\h:\w (already names user + machine). Silent login.
 PS1="\u@\h:\w\\$ "
+
+# Load the FAE's own customizations HERE — after PS1 (a custom prompt wins) and
+# before the FAE_CAPTURE early return (customizations load with capture off
+# too). Silent when there is nothing to load or nothing conflicts.
+[[ "$FAE_CAPTURE" == 1 ]] && _fae_snapshot_wrappers
+_fae_load_user_rc
+[[ "$FAE_CAPTURE" == 1 ]] && _fae_harden_capture
 
 # Skip all capture when disabled — behaves like a plain, silent bashrc.
 if [[ "$FAE_CAPTURE" != 1 ]]; then
@@ -577,6 +857,11 @@ if [[ -z "$_FAE_SESSION_ACTIVE" ]]; then
     : >> "$FAE_SESSION_DIR/commands.log" 2>/dev/null; : >> "$FAE_SESSION_DIR/edits.log" 2>/dev/null
     echo $$ > "$FAE_SESSION_DIR/.open"          # owning PID: alive == session live
     _fae_manifest OPEN "$(basename "$FAE_SESSION_DIR")" "session started (pid $$)"
+    # This machine is NOT the stock environment if a user file was loaded — an
+    # auditor (or the AI reading these logs) has to be able to see that. Written
+    # here, not at load time, because the session dir did not exist yet. No
+    # customizations == no USERRC line at all.
+    [[ -z "$_fae_userrc_note" ]] || _fae_manifest USERRC "$(basename "$FAE_SESSION_DIR")" "$_fae_userrc_note"
     # Clean logout: finalize best-effort. Crash/disconnect: next login's
     # _fae_finalize_orphans picks it up (both paths are idempotent).
     trap '[[ "$$" == "$_FAE_OWNER_PID" ]] && _fae_finalize_session "$FAE_SESSION_DIR"' EXIT
@@ -593,3 +878,23 @@ esac
 FAE_BASHRC_EOF
 
 echo "Installed embedded FAE bashrc to ${target_file}"
+
+# -----------------------------------------------------------------------------
+# 5. Report what happened to the customizations
+# -----------------------------------------------------------------------------
+if [[ -n "${user_rc_written}" ]]; then
+  echo "Migrated your shell customizations from ${migrate_note}"
+  echo "  -> ${user_rc_written}"
+  if [[ "${user_rc_written}" != "${user_rc}" ]]; then
+    echo "  NOTE: ${user_rc} already exists and was NOT modified."
+    echo "        Review ${user_rc_written} and merge by hand what you want to keep."
+  fi
+  if [[ ${#disabled_report[@]} -gt 0 ]]; then
+    echo "  Commented out ${#disabled_report[@]} line(s) that would break command/edit capture:"
+    for r in "${disabled_report[@]}"; do echo "    - ${r}"; done
+    echo "  They are marked '# [fae v0.5 disabled]' in the file if you want to review them."
+  fi
+else
+  echo "No shell customizations migrated (${migrate_note})."
+fi
+echo "From now on your own aliases/PATH belong in ${user_rc} — upgrades never overwrite it."
