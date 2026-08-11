@@ -65,7 +65,16 @@ esac
 [[ -d "$src_dir" ]] || { echo "✗ 找不到正本資料夾: $src_dir" >&2; exit 1; }
 
 # 找版號最大的檔案:<prefix>V<版號>.sh
-latest_file="$(ls "$src_dir/${prefix}V"*.sh 2>/dev/null | sort -V | tail -1 || true)"
+# 這裡的版號沿用工具庫的「小數式」命名(例如 v0.41 < v0.5); sort -V
+# 會把 0.41 誤排在 0.5 後面,所以用數值排序。
+latest_file="$(
+  for f in "$src_dir/${prefix}V"*.sh; do
+    [[ -f "$f" ]] || continue
+    v="${f##*${prefix}V}"
+    v="${v%.sh}"
+    printf '%s\t%s\n' "$v" "$f"
+  done | sort -t $'\t' -k1,1n | tail -1 | cut -f2-
+)"
 [[ -n "$latest_file" ]] || { echo "✗ 在 $src_dir 找不到 ${prefix}V*.sh" >&2; exit 1; }
 
 version="$(basename "$latest_file" | sed -E "s/^${prefix}V([0-9.]+)\.sh$/\1/")"
