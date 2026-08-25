@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# collect_site_config.sh v1.17 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 site config 站頁。
+# collect_site_config.sh v1.18 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 site config 站頁。
+# v1.18 hardware / enclosure additions are unverified on real RAID hardware.
 # 2026-08-07 起**報告輸出全部英文**(國外 FAE 也要用);shell 註解仍保持中文(給維護者看)。
 #
 # 常態用法(零參數):
@@ -31,7 +32,7 @@ while [ $# -gt 0 ]; do
       [ -n "$PEER" ] || { echo "--peer requires [user@]host" >&2; exit 2; }
       shift 2 ;;
     -h|--help)
-      printf '%s v1.17 — read-only capture of a customer site environment; prints Markdown to paste into the site config page.\n\n' "$SCRIPT_NAME"
+      printf '%s v1.18 — read-only capture of a customer site environment; prints Markdown to paste into the site config page.\n\n' "$SCRIPT_NAME"
       printf '  bash %s [deploy-dir]            defaults to ~/website. The report is printed to the screen, no file is written\n' "$SCRIPT_NAME"
       printf '  bash %s --peer [user@]host      only prints the command to run this script on that host, then exits; does not capture this host\n' "$SCRIPT_NAME"
       printf '  bash %s --ai-landing-dir DIR    set this when AI Landing is not auto-detected\n\n' "$SCRIPT_NAME"
@@ -143,6 +144,7 @@ sq() {
 sec()  { printf '\n<!--SEC:%s-->\n## %s\n\n' "$1" "$2"; }
 kv()   { printf -- '- **%s**: %s\n' "$1" "$2"; }
 note() { printf -- '- _(skipped: %s)_\n' "$1"; }
+dmi_s() { sq dmidecode -s "$1" 2>/dev/null | grep -v '^#' | head -1; }
 # 只取單一鍵的值,不 source 整個 env 檔
 envval() {
   [ -f "$1" ] || return 0
@@ -221,7 +223,7 @@ fi
 # 報告不落地靠螢幕複製,所以要起訖標記;走 stderr 才不會混進 stdout。
 printf '\n===== COPY FROM HERE (down to "END OF COPY") =====\n\n' >&2
 
-printf '<!--COLLECTOR:v1.17-->\n'
+printf '<!--COLLECTOR:v1.18-->\n'
 printf '# site config capture — %s(%s)\n' "$(hostname 2>/dev/null || echo unknown)" "$NODE_SELF"
 printf '> Read-only capture. Sensitive values (credentials / private keys) are deliberately not collected.\n'
 printf '> Privilege: %s\n' "${SUDO_NOTE:-not determined}"
@@ -418,6 +420,7 @@ else
 fi
 
 # ── 3. 硬體 ──────
+IS_VM=0; have systemd-detect-virt && [ "$(systemd-detect-virt 2>/dev/null)" != "none" ] && IS_VM=1
 sec hw "3. Hardware"
 if have lscpu; then
   kv "CPU model" "$(lscpu 2>/dev/null | grep -E 'Model name' | sed 's/.*: *//')"
@@ -448,7 +451,56 @@ elif sudo_ready; then
 else
   printf -- '_Serial / warranty / supplier need to be looked up separately (needs root: %s)_\n' "${SUDO_NOTE:-not determined}"
 fi
-
+printf '<!--SEC:hw.board-->\n### Baseboard / BIOS / chassis\n'
+if ! have dmidecode; then note "no dmidecode; baseboard, BIOS and chassis detail cannot be read"
+elif ! sudo_ready; then note "baseboard, BIOS and chassis detail needs root: ${SUDO_NOTE:-not determined}"
+else
+  kv "Baseboard vendor / product" "$(dmi_s baseboard-manufacturer) / $(dmi_s baseboard-product-name)"; kv "Baseboard version / serial" "$(dmi_s baseboard-version) / $(dmi_s baseboard-serial-number)"; kv "BIOS vendor / version / date" "$(dmi_s bios-vendor) / $(dmi_s bios-version) / $(dmi_s bios-release-date)"; kv "Chassis type" "$(dmi_s chassis-type)"
+  [ "$IS_VM" = "1" ] && note "VM: these DMI values come from the hypervisor, not physical-machine information"
+fi
+printf '<!--SEC:hw.memory-->\n### Memory slots\n'
+if ! have dmidecode; then note "no dmidecode; DIMM slot detail cannot be read"
+elif ! sudo_ready; then note "DIMM slot detail needs root: ${SUDO_NOTE:-not determined}"
+elif [ "$IS_VM" = "1" ]; then note "VM has no physical memory-slot information"
+else
+  _MEMRAW="$(sq dmidecode -t memory 2>/dev/null)" # Unknown/0 MB is empty only with blank Manufacturer and Part Number; otherwise installed with unreadable capacity.
+  _MEMPARSED="$(printf '%s\n' "$_MEMRAW" | awk '
+    function val(   x){x=$0; sub(/^[^:]*:[[:space:]]*/,"",x); return x}
+    function flush(   k,empty_slot,capacity_unreadable,display_size,row_size){if(!got)return; total++; empty_slot=(size=="" || size ~ /^(No Module Installed|Not Installed)$/); capacity_unreadable=(size ~ /^(Unknown|0 MB)$/); if(capacity_unreadable){if(maker!="" || part!=""){empty_slot=0; display_size=size " (capacity unreadable)"} else {empty_slot=1; row_size=""}}; if(empty_slot){empty++; if(row_size=="")row_size=size; rows=rows "@@SLOT\t" loc "\t" row_size "\n"} else {if(cfg!="")speed=cfg; if(display_size=="")display_size=size; installed++; k=type SUBSEP display_size SUBSEP speed SUBSEP maker SUBSEP part; if(!(k in count))order[++ng]=k; count[k]++; desc[k]=type "\t" display_size "\t" speed "\t" maker "\t" part; rows=rows "@@SLOT\t" loc "\t" display_size "\n"}; got=0; size=type=speed=cfg=maker=part=loc=""}
+    /^Memory Device[[:space:]]*$/ {flush(); got=1; next}
+    got && /^[[:space:]]*Size:/ {size=val(); next} got && /^[[:space:]]*Type:/ {type=val(); next} got && /^[[:space:]]*Configured Memory Speed:/ {cfg=val(); next} got && /^[[:space:]]*Speed:/ {speed=val(); next}
+    got && /^[[:space:]]*Manufacturer:/ {maker=val(); next} got && /^[[:space:]]*Part Number:/ {part=val(); next} got && /^[[:space:]]*Locator:/ {loc=val(); next}
+    END {flush(); print "@@COUNT\t"(total+0)"\t"(installed+0)"\t"(empty+0); for(i=1;i<=ng;i++)print "@@GROUP\t"desc[order[i]]"\t"count[order[i]]; printf "%s",rows}
+  ' )"
+  _MEMCOUNT="$(printf '%s\n' "$_MEMPARSED" | sed -n 's/^@@COUNT\t//p')"
+  if [ -n "$_MEMCOUNT" ]; then _MTOTAL="$(printf '%s\n' "$_MEMCOUNT" | awk -F '\t' '{print $1}')"; _MINST="$(printf '%s\n' "$_MEMCOUNT" | awk -F '\t' '{print $2}')"; _MEMPTY="$(printf '%s\n' "$_MEMCOUNT" | awk -F '\t' '{print $3}')"
+    kv "DIMM slots" "$_MTOTAL total / installed $_MINST / empty $_MEMPTY"
+    printf '%s\n' "$_MEMPARSED" | sed -n 's/^@@GROUP\t//p' | awk -F '\t' '{printf "- **Installed memory**: %s %s %s %s (%s) x%s\n",$1,$2,$3,$4,$5,$6}'
+    if [ "$_MTOTAL" -gt 32 ] 2>/dev/null; then note "more than 32 DIMM slots; the per-slot table was omitted"; else
+      printf '```\n'; printf '%-24s %s\n' Locator Capacity
+      printf '%s\n' "$_MEMPARSED" | sed -n 's/^@@SLOT\t//p' | awk -F '\t' '{printf "%-24s %s\n",$1,($2=="" ? "(empty)" : $2)}'; printf '```\n'
+    fi
+  else
+    note "dmidecode returned no Memory Device blocks"
+  fi
+fi
+printf '<!--SEC:hw.psu-->\n### Power supplies\n'
+if ! have dmidecode; then note "no dmidecode; PSU detail cannot be read"
+elif ! sudo_ready; then note "PSU detail needs root: ${SUDO_NOTE:-not determined}"
+else
+  _PSU="$(sq dmidecode -t 39 2>/dev/null | awk '
+    function val(   x){x=$0; sub(/^[^:]*:[[:space:]]*/,"",x); return x}
+    function flush(   k){if(!got)return; n++; k=max SUBSEP maker SUBSEP name SUBSEP status; if(!(k in c))o[++ng]=k; c[k]++; d[k]=max "\t" maker "\t" name "\t" status; got=0; max=maker=name=status=""}
+    /^System Power Supply[[:space:]]*$/ {flush(); got=1; next} got && /^[[:space:]]*Max Power Capacity:/ {max=val(); next} got && /^[[:space:]]*Manufacturer:/ {maker=val(); next} got && /^[[:space:]]*Name:/ {name=val(); next} got && /^[[:space:]]*Status:/ {status=val(); next}
+    END {flush(); print "@@COUNT\t"(n+0); for(i=1;i<=ng;i++)print "@@GROUP\t"d[o[i]]"\t"c[o[i]]}
+  ' )"
+  _PSUN="$(printf '%s\n' "$_PSU" | sed -n 's/^@@COUNT\t//p')"
+  if [ -n "$_PSUN" ] && [ "$_PSUN" -gt 0 ] 2>/dev/null; then
+    kv "PSU count" "$_PSUN"; printf '%s\n' "$_PSU" | sed -n 's/^@@GROUP\t//p' | awk -F '\t' '{printf "- **PSU**: %s / %s / %s / %s x%s\n",$1,$2,$3,$4,$5}'
+  else
+    note "dmidecode -t 39 returned no System Power Supply blocks"
+  fi
+fi
 # ── 4. OS / Docker / 儲存 ──────
 sec os "4. OS / Docker / storage"
 kv "OS" "$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
@@ -469,21 +521,15 @@ if [ -n "$VIRT" ] && [ "$VIRT" != "none" ] && [ -r /proc/stat ]; then
   esac
 fi
 if have docker; then kv "Docker" "$(docker --version 2>/dev/null)"; else note "no docker"; fi
-# 控制器偵測要提早在這裡算:「實體碟總覽」需要它判斷顆數可不可信。
 HWCTL=""
 have lspci && HWCTL="$(lspci 2>/dev/null | grep -iE 'RAID bus controller|Serial Attached SCSI controller|Mass storage controller|SATA controller|Non-Volatile memory controller')"
 HW_CTL_RAID=0
 printf '%s\n' "$HWCTL" | grep -qi 'RAID bus controller' && HW_CTL_RAID=1
-# **沒有 lspci ≠ 沒有控制器**(pciutils 不是每台都裝)。少了這個旗標,下面「硬體 RAID」段會把
-# 「查不了」印成「這台沒有 RAID 控制器」—— 是被當成事實抄進站頁的假否定,比空白更糟。
 HW_CTL_UNKNOWN=0
 have lspci || HW_CTL_UNKNOWN=1
 IMSM_SEEN=0   # 下面 md 段偵測到 Intel RST 時設 1;硬體 RAID 段要用(md 段在它前面)
-# 先回答「這台幾顆碟」。用 -P(key="value")而不是欄位對齊:MODEL 常含空白(PERC H730P Mini),
-# 欄位切割會把它切成兩欄、序號跟著跑位。
 printf '<!--SEC:hw.disks-->\n### Physical disk overview\n'
 DISKROWS=""
-# 這兩個旗標會傳到下面的「硬體 RAID」段用:碟的型號本身就是「這台的碟是誰做出來的」的線索。
 HW_RAID_HINT=0    # 型號看起來是 RAID 控制器做出來的 virtual disk
 HW_VDISK_HINT=0   # 型號看起來是 hypervisor 給的虛擬碟
 VDRAID=""         # 命中前者的裝置名(空白分隔)
@@ -495,7 +541,7 @@ if have lsblk; then
   # 舊版逐字比對會漏掉後者。清單裡的 `DELLBOSS` 是 Dell BOSS 開機鏡像卡的 VD 型號(`DELLBOSS VD`)——
   # 它在 lspci 只是一張 `SATA controller`,不加這個字串整張卡會完全隱形。
   # **刻意不加單獨的 `DELL`**:Dell 認證的直連碟 VENDOR 也可能是 DELL,會把實體碟誤標成 virtual disk。
-  DISKRAW="$(lsblk -dn -P -e 7,11 -o NAME,SIZE,ROTA,TRAN,TYPE,VENDOR,MODEL,SERIAL 2>/dev/null | awk '
+  DISKRAW="$(lsblk -dn -P -e 7,11 -o NAME,SIZE,ROTA,TRAN,TYPE,VENDOR,MODEL,SERIAL 2>/dev/null | cat | awk '
     function g(s, k,   r) {
       r = ""
       if (match(s, k "=\"[^\"]*\"")) { r = substr(s, RSTART, RLENGTH); sub(k "=\"", "", r); sub(/"$/, "", r) }
@@ -562,6 +608,7 @@ if have lsblk; then
 else
   note "no lsblk; disk count and models have to be looked up by hand"
 fi
+printf -- '- _Note: disks behind a RAID controller appear here as virtual disks; use the Hardware RAID section / storcli for physical-disk details._\n'
 printf '<!--SEC:storage.blockdev-->\n### Block devices / partitions\n```\n'
 # -e 7 濾掉 loop 裝置(snap 裝的 microk8s 實測 29 個 squashfs,會淹掉磁碟結構)。
 # 結尾 `| cat`:lsblk 依終端機寬度會截斷最後一欄,stdout 是 pipe 時才不截斷。
@@ -572,7 +619,7 @@ printf '```\n'
 # `df` 有但 `lsblk` 沒有的碟:裝置已不在 /sys/block(拔掉 / 掉出控制器 / 熱插拔沒重掛)但掛載還在。
 # **這種碟不算在「實體碟總覽」的顆數裡**,不標的話那個顆數會被當成完整清單。
 if have lsblk && [ -r /proc/mounts ]; then
-  LSBLK_ALL="$(lsblk -alno NAME 2>/dev/null | tr -d ' ' | sort -u)"
+  LSBLK_ALL="$(lsblk -alno NAME 2>/dev/null | cat | tr -d ' ' | sort -u)"
   GHOSTDEV=""
   for _md in $(awk '$1 ~ /^\/dev\// {print $1}' /proc/mounts 2>/dev/null | sort -u); do
     _b="${_md#/dev/}"
@@ -665,7 +712,7 @@ if have vgs; then
   printf '<!--SEC:storage.lvm-->\n### LVM\n'
   if [ -n "$LVM_OUT" ]; then
     printf '```\n%s\n```\n' "$LVM_OUT"
-  elif lsblk -o FSTYPE 2>/dev/null | grep -q LVM2_member; then
+  elif lsblk -o FSTYPE 2>/dev/null | cat | grep -q LVM2_member; then
     note "LVM2_member partitions detected, but vgs/lvs need root to read ($SUDO_NOTE)"
   else
     printf -- '- No LVM\n'
@@ -689,7 +736,7 @@ else
   fi
 fi
 # btrfs 只在真的有 btrfs 檔案系統時才查,避免在每台機器上多印一段無關的「無」
-if lsblk -o FSTYPE 2>/dev/null | grep -q btrfs; then
+if lsblk -o FSTYPE 2>/dev/null | cat | grep -q btrfs; then
   printf '<!--SEC:storage.btrfs-->\n### btrfs (a btrfs filesystem was detected)\n'
   if ! have btrfs; then
     note "btrfs partitions exist but there is no btrfs command, so the RAID profile cannot be read"
@@ -704,10 +751,6 @@ if lsblk -o FSTYPE 2>/dev/null | grep -q btrfs; then
     fi
   fi
 fi
-# 硬體 RAID 分兩層:① 控制器型號(lspci,非 root 可讀);② 陣列狀態(只有廠商 CLI 問得到,需 root)。
-# 兩層都拿不到時要明講量不到,不能讓「md 成員全部在線」被讀成「陣列沒問題」。
-# 而且**實務上第二層多半拿不到**(客戶站沒裝廠商 CLI、或這次沒有 root),所以「量不到」不能說完就算——
-# 要把站頁 C2 需要的欄位逐條列出來,讓人有東西可以去 BMC 抄。
 bmc_raid_todo() {
   printf -- '- **Copy these from the BMC (iDRAC / iLO / IPMI web) or by running the vendor CLI by hand** -- site page block C2 needs them and **none of them can be reached from the OS**:\n'
   printf -- '  1. Controller model + firmware version\n'
@@ -716,25 +759,68 @@ bmc_raid_todo() {
   printf -- '  4. Hot spares: how many, and global or dedicated\n'
   printf -- '  5. Every disk that is not Online -- failed / rebuilding / foreign / **predictive failure** -- with its enclosure:slot number\n'
   printf -- '  6. BBU / CacheVault state, and the write cache policy of each VD (WriteBack vs WriteThrough)\n'
+  printf -- '  7. Enclosure slots and empty slots (BMC → Storage / Physical Drives, or the chassis backplane label): total / installed / empty\n'
+  printf -- '  8. Memory slots and empty slots (BMC → System Inventory / Memory, or the boot self-test screen)\n'
+}
+raid_encl_report() {
+  _ERAW="$1"; _EC="$2"
+  _EROWS="$(printf '%s\n' "$_ERAW" | awk '
+    /^Enclosures[[:space:]]*=/ {expected=$NF} /^Enclosure LIST/ {en=1; next}
+    en && /ProdID/ {pcol=index($0,"ProdID"); vcol=index($0,"VendorSpecific"); header=1; next} en && /^[[:space:]]*$/ {if(started) en=0; next}
+    en && /^---/ {next} en && header && $1=="EID" {next}
+    en && header && $1 ~ /^[0-9]+$/ && NF>=4 {p=(vcol>pcol ? substr($0,pcol,vcol-pcol) : substr($0,pcol)); sub(/^[[:space:]]+/,"",p); sub(/[[:space:]]+$/,"",p); vs=""; if(vcol>pcol){vs=substr($0,vcol); sub(/^[[:space:]]+/,"",vs); sub(/[[:space:]]+$/,"",vs)}; if(vs=="")vs="-"; e="not-calculated"; if($3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/) e=$3-$4; v=(p=="VirtualSES" || p=="SGPIO") ? 1 : 0; print "@@ROW\t"$1"\t"$2"\t"$3"\t"$4"\t"e"\t"p"\t"vs"\t"v; started=1; count++}
+    END {print "@@META\t"(expected+0)"\t"(count+0)}
+  ')"
+  _EMETA="$(printf '%s\n' "$_EROWS" | sed -n 's/^@@META\t//p')"; IFS='	' read -r _EEXPECTED _ECOUNT <<EOF
+$_EMETA
+EOF
+  printf -- '- **c%s enclosure**: %s\n' "$_EC" "${_ECOUNT:-0}"
+  if [ "${_ECOUNT:-0}" -gt 0 ] 2>/dev/null; then
+    _EROWS_ONLY="$(printf '%s\n' "$_EROWS" | sed -n 's/^@@ROW\t//p')"
+    while IFS='	' read -r _eid _state _slots _pd _empty _prod _vendor _virt; do
+      [ -n "$_eid" ] || continue
+      printf '  - EID %s `%s` — %s slots / installed %s / empty %s (State %s)' "$_eid" "$_prod" "$_slots" "$_pd" "$_empty" "$_state"; [ "$_vendor" != "-" ] && printf ' [VendorSpecific: %s]' "$_vendor"; [ "$_virt" = "1" ] && printf ' (%s: virtual SES, slot count does not represent physical slots)' "$_prod"; printf '\n'
+      [ "$_empty" = "not-calculated" ] && printf -- '    - _Empty slot count not calculated: Slots=%s / PD=%s is not numeric_\n' "$_slots" "$_pd"
+    done <<EOF
+$_EROWS_ONLY
+EOF
+  fi
+  [ "${_EEXPECTED:-0}" -ne "${_ECOUNT:-0}" ] 2>/dev/null && note "storcli reported $_EEXPECTED enclosures but the Enclosure LIST parser found $_ECOUNT"
+}
+storcli_report() {
+  _SC_BASE="$1"; _SC_OUT="$2"; _SC_CTL="$(printf '%s\n' "$_SC_BASE" | sed 's/[[:space:]]*show$//')"
+  printf -- '- Read-only query: `%s`\n' "$_SC_BASE"
+  printf '%s\n' "$_SC_OUT" | awk -v cli="$(basename "$RCLI")" -v base="$_SC_CTL" '
+    /^Product Name/ {sub(/^[^=]*= */,""); prod=$0} /^FW Package Build/ {sub(/^[^=]*= */,""); fw=$0} /^Virtual Drives/ {sub(/^[^=]*= */,""); nvd=$0} /^Physical Drives/ {sub(/^[^=]*= */,""); npd=$0}
+    /^[0-9]+\/[0-9]+[ \t]/ {vd=vd sprintf("%s %s **%s** cache %s %s %s;  ",$1,$2,$3,$6,$9,$10); if($3!="Optl") badvd=badvd " " $1 "(" $3 ")"; if(index($6,"WT")>0) wt=wt " " $1}
+    /^[0-9]+:[0-9]+[ \t]/ {pn++; st[$3]++; if(model==""){model=$12; psz=$5 " " $6; intf=$7 " " $8}; if($3!="Onln" && $3!="GHS" && $3!="DHS" && $3!="UGood") badpd=badpd " " $1 "(" $3 ")"}
+    END {if(prod!="") printf "- **Controller**: %s (FW %s)\n",prod,fw; if(vd!=""){sub(/;  $/,"",vd); printf "- **Arrays (VD)**: %s -- %s\n",nvd,vd}
+      if(pn>0){s=""; for(k in st)s=s sprintf("%s %d / ",k,st[k]); sub(/ \/ $/,"",s); printf "- **Physical disks behind the controller**: **%s** (%s) -- %s %s %s\n",(npd==""?pn:npd),s,model,psz,intf; if(npd!="" && npd+0!=pn) printf "- _The header says %s disks but the table only has %d rows, which is inconsistent -- run the command above by hand to confirm_\n",npd,pn}
+      if(wt!="") printf "- _Write cache is **WriteThrough** on VD%s (`WT` in the cache column). That can be by design, or what a dead BBU / CacheVault falls back to -- **BBU state is not on this page**: `%s/bbu show`_\n",wt,base
+      if(badvd!="" || badpd!="") printf "- **Abnormal:%s%s** -- this needs attention immediately\n",(badvd==""?"":" VD" badvd),(badpd==""?"":" PD" badpd)
+      else if(vd!="" || pn>0){printf "- **Abnormal**: none **in what this query reports** (every VD is Optl, every PD is Onln or a hot spare)\n"; printf "- _Not a full health verdict: this page has **no per-disk media / predictive-failure counters and no BBU state**. For those run `%s/eall/sall show all` and `%s/bbu show`_\n",base,base}}'
+  printf -- '- _The `Disks visible to the OS` row is a count of virtual disks; **the count here is the number of physical disks**_\n'; _SC_BODY="$(printf '%s\n' "$_SC_OUT" | grep -vE '^[A-Za-z][A-Za-z0-9 ]*=.*\|' | grep -v '^Check Consistency$' | grep -v 'Generating detailed summary' | cat -s)"
+  printf '```\n%s\n```\n' "$(printf '%s\n' "$_SC_BODY" | head -200)"; [ "$(printf '%s\n' "$_SC_BODY" | wc -l | tr -d ' ')" -gt 200 ] && printf -- '- _(Output was long, only the first 200 lines are kept; run the command above on the site for the full text. The legend block has been cut)_\n'
+  printf -- '- _State reference: VD `Optl`=healthy / `Dgrd`=missing a disk / `Pdgd`=partially degraded; PD `Onln`=in the array / `GHS`=global hot spare / `UGood`=unconfigured / `Failed`,`Offln`,`Msng`=replace / `Rbld`=rebuilding_\n'
 }
 printf '<!--SEC:hw.raid_ctrl-->\n### Hardware RAID (controller)\n'
-# HWCTL / HW_CTL_RAID 在「實體碟總覽」之前就算好了(見那裡的註解),這裡只負責印
 if ! have lspci; then
-  # 不用 note():那個格式是「(skipped: …)」,語氣像可有可無的一格,而這裡是「查不了」——
-  # 後面那句「無法判定」才是結論,這行只負責講清楚少了什麼工具。
   printf -- '- **No `lspci` (pciutils is not installed)**, so the controller model cannot be read on this host -- it has to come from the BMC or the machine label\n'
 elif [ -n "$HWCTL" ]; then
   printf '```\n%s\n```\n' "$HWCTL"
+  _CTLINFO="$(printf '%s\n' "$HWCTL" | awk '{s=$0; b=$1; sub(/^[^ ]+[[:space:]]+/,"",s); sub(/^[^:]*controller:[[:space:]]*/,"",s); if(n++) out=out ", "; out=out s " (" b ")"} END{print n "\t" out}')"
+  IFS='	' read -r _CTLN _CTLS <<EOF
+$_CTLINFO
+EOF
+  kv "Storage controllers" "$_CTLN — $_CTLS"
   printf -- '- _`RAID bus controller` = a hardware RAID card, or the motherboard in RAID mode; `Serial Attached SCSI controller` is usually a plain HBA (no RAID, RAID is done in the OS); `SATA controller` / `Non-Volatile memory controller` = on-board, disks are attached directly_\n'
-  # 只有「控制器層 + 主機板 fakeRAID」真的並存時才印這句,否則會指向不存在的東西。
   [ "$IMSM_SEEN" = "1" ] && [ "$HW_CTL_RAID" = "1" ] &&
     printf -- '- _This host has both: the system disks go through motherboard RAID (see `external:imsm` in the md section above) and the data disks through a RAID card_\n'
 else
   printf -- '- `lspci` shows no storage controller (common for the virtual disks of a VM)\n'
 fi
-# 廠商 CLI:這類工具幾乎都不在 PATH(裝在 /opt 底下),所以 PATH 與 /opt 常見路徑都要找
+printf '<!--SEC:hw.raid_encl-->\n### RAID enclosure slots\n'
 RCLI=""
-# mvcli(Dell BOSS / Marvell 主機板 RAID)與 cli64(Areca)放最後:主流卡先命中,免得一台同時有兩支時選錯。
 for _c in storcli64 storcli perccli64 perccli ssacli hpssacli hpacucli arcconf sas3ircu sas2ircu tw_cli MegaCli64 MegaCli megacli mvcli cli64; do
   if have "$_c"; then RCLI="$_c"; break; fi
   for _p in /opt/MegaRAID/storcli /opt/MegaRAID/perccli /opt/MegaRAID/MegaCli /opt/MegaRAID/CmdTool2 \
@@ -745,9 +831,7 @@ for _c in storcli64 storcli perccli64 perccli ssacli hpssacli hpacucli arcconf s
   [ -n "$RCLI" ] && break
 done
 if [ -z "$RCLI" ]; then
-  # **沒有陣列就不要說量不到**(無中生有的缺口比漏報還糟),但反過來也不能把「查不了」講成「沒有」。
-  # 四句話:有卡沒 CLI → BMC;虛擬碟 → 問虛擬化管理者;連 lspci 都沒有 → 明講無法判定;
-  # lspci 跑過且真的沒看到 → 沒有控制器層的陣列要查。
+  note "enclosure slots need storcli/perccli and root; no supported CLI was found"
   if [ "$HW_RAID_HINT" = "1" ] || [ "$HW_CTL_RAID" = "1" ]; then
     printf -- '- **There is a RAID controller but no vendor CLI** (looked for storcli / perccli / MegaCli / ssacli / arcconf / sas3ircu / tw_cli / mvcli / cli64 in PATH and the usual /opt paths, none found)\n'
     printf -- '- **So array health, whether anything is degraded, which disk failed and how many disks are underneath cannot be measured on this host** -- all of that lives in the controller layer and is never visible to `lsblk` / `mdstat` / `df`. Go through the **BMC (iDRAC / iLO / IPMI web)**, or ask the customer to install the vendor CLI and run this again.\n'
@@ -763,16 +847,13 @@ if [ -z "$RCLI" ]; then
   fi
 else
   kv "Vendor CLI" "\`$RCLI\`"
-  # 一律只用 show / display / info / GETCONFIG 這類「讀」的子指令,不下 set / start / rebuild。
-  # RCLI_PD_CMD:這支 CLI 的預設查詢**不含實體碟狀態**時填「還要另外跑什麼」——
-  # 「哪顆碟壞了」是這一段存在的理由,沒查到就要明寫,不能只貼一份看不出來的 LD 輸出。
   RCLI_PD_CMD=""
   case "$(basename "$RCLI")" in
-    storcli*|perccli*)  RCLI_CMD="$RCLI /c0 show" ;;             # 一頁含 controller + VD + PD 狀態
+    storcli*|perccli*)  RCLI_CMD="$RCLI /c0 show" ;;
     MegaCli*|megacli)   RCLI_CMD="$RCLI -LDInfo -Lall -aALL"; RCLI_PD_CMD="$RCLI -PDList -aALL" ;;
-    ssacli|hpssacli|hpacucli) RCLI_CMD="$RCLI ctrl all show config" ;;   # config 已含 physicaldrive 狀態
+    ssacli|hpssacli|hpacucli) RCLI_CMD="$RCLI ctrl all show config" ;;
     arcconf)            RCLI_CMD="$RCLI GETCONFIG 1 LD"; RCLI_PD_CMD="$RCLI GETCONFIG 1 PD" ;;
-    sas3ircu|sas2ircu)  RCLI_CMD="$RCLI 0 DISPLAY" ;;            # DISPLAY 已含 physical device 清單
+    sas3ircu|sas2ircu)  RCLI_CMD="$RCLI 0 DISPLAY" ;;
     tw_cli)             RCLI_CMD="$RCLI info"; RCLI_PD_CMD="$RCLI info c0" ;;
     mvcli)              RCLI_CMD="$RCLI info -o vd"; RCLI_PD_CMD="$RCLI info -o pd" ;;
     cli64)              RCLI_CMD="$RCLI vsf info"; RCLI_PD_CMD="$RCLI disk info" ;;
@@ -781,81 +862,48 @@ else
   if [ -z "$RCLI_CMD" ]; then
     note "this CLI is recognised but there is no matching read-only query command for it; run it by hand"
   elif sudo_ready; then
-    # shellcheck disable=SC2086
-    RCLI_OUT="$(sq $RCLI_CMD 2>/dev/null)"
-    if [ -n "$RCLI_OUT" ]; then
-      printf -- '- Read-only query: `%s`\n' "$RCLI_CMD"
-      # `storcli /c0 show` 約 175 行、最有價值的 PD LIST 在後段(舊版 head -150 正好切掉)。
-      # 先解析摘要(對應站頁模板 C2:陣列 / level / 成員碟 / 狀態)再貼原文;只解析 storcli / perccli。
-      case "$(basename "$RCLI")" in
-        storcli*|perccli*)
-          printf '%s\n' "$RCLI_OUT" | awk -v cli="$(basename "$RCLI")" '
-            /^Product Name/     { sub(/^[^=]*= */, ""); prod = $0 }
-            /^FW Package Build/ { sub(/^[^=]*= */, ""); fw = $0 }
-            /^Virtual Drives/   { sub(/^[^=]*= */, ""); nvd = $0 }
-            /^Physical Drives/  { sub(/^[^=]*= */, ""); npd = $0 }
-            # VD LIST 資料列:`0/0   RAID6 Optl  RW  Yes  RWTD  -  ON  229.188 TB`
-            /^[0-9]+\/[0-9]+[ \t]/ {
-              vd = vd sprintf("%s %s **%s** cache %s %s %s;  ", $1, $2, $3, $6, $9, $10)
-              if ($3 != "Optl") badvd = badvd " " $1 "(" $3 ")"
-              # Cache 欄含 WT = 寫入快取是 WriteThrough。可能是刻意設定,也可能是 BBU 掛了自動掉回來——
-              # 這一頁看不到 BBU,所以只陳述事實與「這頁看不到什麼」,不判斷對錯。
-              if (index($6, "WT") > 0) wt = wt " " $1
-            }
-            # PD LIST 資料列:`8:0  55 Onln  0 16.370 TB SAS HDD N N 512B ST18000NM004J U -`
-            /^[0-9]+:[0-9]+[ \t]/ {
-              pn++; st[$3]++
-              if (model == "") { model = $12; psz = $5 " " $6; intf = $7 " " $8 }
-              # Onln=在陣列中、GHS/DHS=熱備、UGood=未配置但健康;其餘(Failed/Offln/UBad/Msng/Rbld)都要點名
-              if ($3 != "Onln" && $3 != "GHS" && $3 != "DHS" && $3 != "UGood") badpd = badpd " " $1 "(" $3 ")"
-            }
-            END {
-              if (prod != "") printf "- **Controller**: %s (FW %s)\n", prod, fw
-              if (vd != "") { sub(/;  $/, "", vd); printf "- **Arrays (VD)**: %s -- %s\n", nvd, vd }
-              if (pn > 0) {
-                s = ""
-                for (k in st) s = s sprintf("%s %d / ", k, st[k])
-                sub(/ \/ $/, "", s)
-                printf "- **Physical disks behind the controller**: **%s** (%s) -- %s %s %s\n", (npd == "" ? pn : npd), s, model, psz, intf
-                # 表頭顆數與表列行數不一致 = 輸出被截或版面不同,要讓人知道別採信其中一個
-                if (npd != "" && npd + 0 != pn)
-                  printf "- _The header says %s disks but the table only has %d rows, which is inconsistent -- run the command above by hand to confirm_\n", npd, pn
-              }
-              if (wt != "")
-                printf "- _Write cache is **WriteThrough** on VD%s (`WT` in the cache column). That can be by design, or what a dead BBU / CacheVault falls back to -- **BBU state is not on this page**: `%s /c0/bbu show`_\n", wt, cli
-              if (badvd != "" || badpd != "")
-                printf "- **Abnormal:%s%s** -- this needs attention immediately\n", (badvd == "" ? "" : " VD" badvd), (badpd == "" ? "" : " PD" badpd)
-              else if (vd != "" || pn > 0) {
-                # 「異常:無」比這頁的資料撐得起的結論強:media error / predictive failure / BBU 都不在這頁,
-                # 一顆即將壞掉的碟狀態仍是 Onln。要把界線講清楚,不然這行會被當成完整健檢結果。
-                printf "- **Abnormal**: none **in what this query reports** (every VD is Optl, every PD is Onln or a hot spare)\n"
-                printf "- _Not a full health verdict: this page has **no per-disk media / predictive-failure counters and no BBU state**. For those run `%s /c0/eall/sall show all` and `%s /c0/bbu show`_\n", cli, cli
-              }
-            }
-          '
-          printf -- '- _The `Disks visible to the OS` row is a count of virtual disks; **the count here is the number of physical disks**_\n' ;;
-        *)
-          # 沒有解析器就只剩原文,而且好幾支 CLI 的預設查詢根本不含 PD —— 缺口要明寫,不能靜默。
+    case "$(basename "$RCLI")" in
+      storcli*|perccli*)
+        _CCRAW="$(sq $RCLI show ctrlcount 2>/dev/null)"
+        _CC="$(printf '%s\n' "$_CCRAW" | sed -n 's/^[[:space:]]*Controller Count[[:space:]]*=[[:space:]]*//p' | head -1)"
+        case "$_CC" in ''|*[!0-9]*|0) note "could not parse Controller Count from `$RCLI show ctrlcount`; falling back to c0"; _CC=1 ;; esac
+        _CCR=$_CC; [ "$_CCR" -gt 4 ] 2>/dev/null && _CCR=4
+        [ "$_CC" -gt 4 ] 2>/dev/null && note "$_CC controllers reported; only c0-c3 were queried (the remaining $(( _CC - 4 )) were omitted)"
+        _CI=0
+        while [ "$_CI" -lt "$_CCR" ]; do
+          RCLI_CMD="$RCLI /c${_CI} show"
+          RCLI_OUT="$(sq $RCLI_CMD 2>/dev/null)"
+          if [ -n "$RCLI_OUT" ]; then
+            storcli_report "$RCLI_CMD" "$RCLI_OUT"
+            # /cX/eall show 的區段標題不是 Enclosure LIST,raid_encl_report 的 parser 收不到列;
+            # /cX show 本身就含 Enclosure LIST,直接重用同一份輸出。
+            raid_encl_report "$RCLI_OUT" "$_CI"
+          else
+            note "$RCLI_CMD returned nothing"
+          fi
+          _CI=$((_CI + 1))
+        done
+        ;;
+      *)
+        note "enclosure slots are not parsed for this CLI (storcli/perccli only)"
+        RCLI_OUT="$(sq $RCLI_CMD 2>/dev/null)"
+        if [ -n "$RCLI_OUT" ]; then
+          printf -- '- Read-only query: `%s`\n' "$RCLI_CMD"
           printf -- '- _No parsed summary for this CLI (only storcli / perccli output is parsed), so the raw output below is all there is -- **read the VD state and the disk count out of it by hand**_\n'
           if [ -n "$RCLI_PD_CMD" ]; then
             printf -- '- **The query above does not include physical-disk state**: how many disks are behind the controller, and whether one of them failed, is **not** in the output below. Run this as well (read-only): `sudo %s`\n' "$RCLI_PD_CMD"
-          fi ;;
-      esac
-      # 原文照貼,但砍掉 legend 區塊(`DG=Disk Group Index|Arr=...` 這類說明佔了快 40 行)
-      RCLI_BODY="$(printf '%s\n' "$RCLI_OUT" |
-        grep -vE '^[A-Za-z][A-Za-z0-9 ]*=.*\|' | grep -v '^Check Consistency$' |
-        grep -v 'Generating detailed summary' | cat -s)"
-      printf '```\n%s\n```\n' "$(printf '%s\n' "$RCLI_BODY" | head -200)"
-      # 有截斷就要說(不然讀者會以為這就是全部)
-      [ "$(printf '%s\n' "$RCLI_BODY" | wc -l | tr -d ' ')" -gt 200 ] &&
-        printf -- '- _(Output was long, only the first 200 lines are kept; run the command above on the site for the full text. The legend block has been cut)_\n'
-      printf -- '- _State reference: VD `Optl`=healthy / `Dgrd`=missing a disk / `Pdgd`=partially degraded; PD `Onln`=in the array / `GHS`=global hot spare / `UGood`=unconfigured / `Failed`,`Offln`,`Msng`=replace / `Rbld`=rebuilding_\n'
-    else
-      note "$RCLI returned nothing (it may be the wrong tool for this card, or this host has no RAID controller)"
-      # 有卡卻問不出東西 = 真的缺一段,不是「這台沒有」。
-      { [ "$HW_RAID_HINT" = "1" ] || [ "$HW_CTL_RAID" = "1" ]; } && bmc_raid_todo
-    fi
+          fi
+          RCLI_BODY="$(printf '%s\n' "$RCLI_OUT" | grep -vE '^[A-Za-z][A-Za-z0-9 ]*=.*\|' | grep -v '^Check Consistency$' | grep -v 'Generating detailed summary' | cat -s)"
+          printf '```\n%s\n```\n' "$(printf '%s\n' "$RCLI_BODY" | head -200)"
+          [ "$(printf '%s\n' "$RCLI_BODY" | wc -l | tr -d ' ')" -gt 200 ] && printf -- '- _(Output was long, only the first 200 lines are kept; run the command above on the site for the full text. The legend block has been cut)_\n'
+          printf -- '- _State reference: VD `Optl`=healthy / `Dgrd`=missing a disk / `Pdgd`=partially degraded; PD `Onln`=in the array / `GHS`=global hot spare / `UGood`=unconfigured / `Failed`,`Offln`,`Msng`=replace / `Rbld`=rebuilding_\n'
+        else
+          note "$RCLI returned nothing (it may be the wrong tool for this card, or this host has no RAID controller)"
+          { [ "$HW_RAID_HINT" = "1" ] || [ "$HW_CTL_RAID" = "1" ]; } && bmc_raid_todo
+        fi
+    esac
   else
+    note "RAID enclosure slots were not queried because root was not available"
     # sudo 已內建,「沒查到」只剩一個原因 —— 這次拿不到 root,把原因直接印出來。
     printf -- '- _**A CLI exists but root was not available this run, so array state was not queried.** Reason: %s. Run this by hand on that host (read-only):_\n' "${SUDO_NOTE:-not determined}"
     printf '```\nsudo %s\n```\n' "$RCLI_CMD"
