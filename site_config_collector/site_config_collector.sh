@@ -470,7 +470,7 @@ else
     /^Memory Device[[:space:]]*$/ {flush(); got=1; next}
     got && /^[[:space:]]*Size:/ {size=val(); next} got && /^[[:space:]]*Type:/ {type=val(); next} got && /^[[:space:]]*Configured Memory Speed:/ {cfg=val(); next} got && /^[[:space:]]*Speed:/ {speed=val(); next}
     got && /^[[:space:]]*Manufacturer:/ {maker=val(); next} got && /^[[:space:]]*Part Number:/ {part=val(); next} got && /^[[:space:]]*Locator:/ {loc=val(); next}
-    END {flush(); print "@@COUNT\t"(total+0)"\t"(installed+0)"\t"(empty+0); for(i=1;i<=ng;i++)print "@@GROUP\t"desc[order[i]]"\t"count[order[i]]; printf "%s",rows}
+    END {flush(); if(total>0){print "@@COUNT\t"(total+0)"\t"(installed+0)"\t"(empty+0); for(i=1;i<=ng;i++)print "@@GROUP\t"desc[order[i]]"\t"count[order[i]]; printf "%s",rows}}
   ' )"
   _MEMCOUNT="$(printf '%s\n' "$_MEMPARSED" | sed -n 's/^@@COUNT\t//p')"
   if [ -n "$_MEMCOUNT" ]; then _MTOTAL="$(printf '%s\n' "$_MEMCOUNT" | awk -F '\t' '{print $1}')"; _MINST="$(printf '%s\n' "$_MEMCOUNT" | awk -F '\t' '{print $2}')"; _MEMPTY="$(printf '%s\n' "$_MEMCOUNT" | awk -F '\t' '{print $3}')"
