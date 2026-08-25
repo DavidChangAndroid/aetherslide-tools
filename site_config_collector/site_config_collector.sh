@@ -72,6 +72,9 @@ if [ -n "$PEER" ]; then
 fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
+# 卡死保險:故障硬體(RAID 控制器)、失聯 daemon(docker/k8s)、stuck NFS hard mount
+# 都能讓底下這些指令永遠不回,沒有 timeout 整支腳本就跟著卡住。沒有 timeout 指令就照跑,不因此擋掉採集。
+tmo() { _t="$1"; shift; if have timeout; then timeout "$_t" "$@"; else "$@"; fi; }
 # ── sudo(v1.13 內建為預設)──────
 # 提示在任何報告輸出之前問完(報告不落地,晚問會被往上洗掉),且一律走 stderr。
 SUDO_OK=0      # 1=可用
@@ -136,8 +139,8 @@ sudo_ready() { [ "$SUDO_OK" = "1" ]; }
 # 唯讀查詢統一入口。刻意不吞 stderr(SMART 段要靠 stderr 判斷「量不到」的原因)。
 sq() {
   case "$SUDO_MODE" in
-    n) sudo -n "$@" ;;
-    S) printf '%s\n' "$SUDO_PW" | sudo -S -p '' "$@" ;;
+    n) tmo 20 sudo -n "$@" ;;
+    S) printf '%s\n' "$SUDO_PW" | tmo 20 sudo -S -p '' "$@" ;;
     *) return 1 ;;
   esac
 }
@@ -198,11 +201,11 @@ if [ -z "$AIL_DIR" ]; then
 fi
 # k8s 指令:microk8s 優先,退回原生 kubectl。判準是「真的問得到 namespace」而非 command -v。
 KCTL=""
-if have microk8s && microk8s kubectl get ns >/dev/null 2>&1; then KCTL="microk8s kubectl"
-elif have kubectl && kubectl get ns >/dev/null 2>&1; then KCTL="kubectl"; fi
-kctl() { [ -n "$KCTL" ] && $KCTL "$@" 2>/dev/null; }
+if have microk8s && tmo 10 microk8s kubectl get ns >/dev/null 2>&1; then KCTL="microk8s kubectl"
+elif have kubectl && tmo 10 kubectl get ns >/dev/null 2>&1; then KCTL="kubectl"; fi
+kctl() { [ -n "$KCTL" ] && tmo 10 $KCTL "$@" 2>/dev/null; }
 HELM=""
-if have microk8s && microk8s helm version >/dev/null 2>&1; then HELM="microk8s helm"
+if have microk8s && tmo 10 microk8s helm version >/dev/null 2>&1; then HELM="microk8s helm"
 elif have helm; then HELM="helm"; fi
 
 # AI_LANDING_URL 提早算:AI Landing 段在「對接」段之前,不提早算會讀不到、定位不了推論主機。
@@ -210,7 +213,7 @@ AIL_URL="$(envval "$DEPLOY_DIR/configs.env" AI_LANDING_URL)"
 AIL_NS="$(yamlval "$AIL_DIR/values.yaml" '^[[:space:]]+namespace:')"
 [ -n "$AIL_NS" ] || AIL_NS="ai-landing"
 HAS_AIL_NS=0
-[ -n "$KCTL" ] && $KCTL get ns "$AIL_NS" >/dev/null 2>&1 && HAS_AIL_NS=1
+[ -n "$KCTL" ] && tmo 10 $KCTL get ns "$AIL_NS" >/dev/null 2>&1 && HAS_AIL_NS=1
 HAS_AIL=0
 { [ -n "$AIL_DIR" ] || [ "$HAS_AIL_NS" = "1" ]; } && HAS_AIL=1
 
@@ -411,7 +414,7 @@ elif [ -f "$CERT" ] && have openssl; then
 elif [ -f "$CERT" ]; then
   note "$CERT exists but this host has no openssl command, so certificate detail cannot be read"
 elif printf '%s' "$(envval "$DEPLOY_DIR/configs.env" MODULES)" | grep -q caddy ||
-     { have docker && docker ps --format '{{.Names}}' 2>/dev/null | grep -q caddy; }; then
+     { have docker && tmo 8 docker ps --format '{{.Names}}' 2>/dev/null | grep -q caddy; }; then
   # 啟用 caddy 的站台憑證由 caddy 自己申請與續約,不會放在 data/ssl
   kv "Certificate management" "caddy (ACME issues / renews automatically), not under $DEPLOY_DIR/data/ssl"
   note "certificate detail would require entering the caddy container or reading its data dir; this script does not enter containers"
@@ -428,11 +431,11 @@ if have lscpu; then
 else note "no lscpu"; fi
 if have free; then kv "RAM" "$(free -h 2>/dev/null | awk '/^Mem:/{print $2}')"; fi
 if have nvidia-smi; then
-  kv "GPU driver / CUDA" "driver $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1) / $(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -1)"
+  kv "GPU driver / CUDA" "driver $(tmo 10 nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1) / $(tmo 10 nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -1)"
 fi
 printf '<!--SEC:hw.gpu-->\n### GPU\n```\n'
 if have nvidia-smi; then
-  nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || nvidia-smi -L 2>/dev/null
+  tmo 10 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || tmo 10 nvidia-smi -L 2>/dev/null
 else note "no nvidia-smi"; fi
 printf '```\n'
 # 序號 / 保固靠 dmidecode(需 root)。序號是查保固的唯一線索,拿到權限就抓。
@@ -614,7 +617,7 @@ printf '<!--SEC:storage.blockdev-->\n### Block devices / partitions\n```\n'
 # 結尾 `| cat`:lsblk 依終端機寬度會截斷最後一欄,stdout 是 pipe 時才不截斷。
 if have lsblk; then lsblk -e 7 -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>/dev/null | cat; else note "no lsblk"; fi
 printf '```\n<!--SEC:storage.mount-->\n### Disk usage / mounts\n```\n'
-if have df; then df -hT 2>/dev/null | grep -vE 'tmpfs|overlay|squashfs'; fi
+if have df; then tmo 10 df -hT 2>/dev/null | grep -vE 'tmpfs|overlay|squashfs'; fi
 printf '```\n'
 # `df` 有但 `lsblk` 沒有的碟:裝置已不在 /sys/block(拔掉 / 掉出控制器 / 熱插拔沒重掛)但掛載還在。
 # **這種碟不算在「實體碟總覽」的顆數裡**,不標的話那個顆數會被當成完整清單。
@@ -705,7 +708,7 @@ fi
 # LVM:vgs/lvs 非 root 會把警告丟 stderr、stdout 留空,看起來像「沒有 LVM」→ 要分辨沒權限。
 # lvs 加 segtype:LVM 自己也能做 RAID,預設欄位看不出 linear 與 raid1 的差別。
 if have vgs; then
-  LVM_OUT="$(vgs 2>/dev/null; lvs -o +segtype 2>/dev/null)"
+  LVM_OUT="$(tmo 10 vgs 2>/dev/null; tmo 10 lvs -o +segtype 2>/dev/null)"
   if [ -z "$LVM_OUT" ] && sudo_ready; then
     LVM_OUT="$(sq vgs 2>/dev/null; sq lvs -o +segtype 2>/dev/null)"
   fi
@@ -723,14 +726,14 @@ printf '<!--SEC:storage.zfs-->\n### ZFS\n'
 if ! have zpool; then
   printf -- '- No ZFS (no `zpool` command)\n'
 else
-  ZP="$(zpool list 2>/dev/null)"
+  ZP="$(tmo 10 zpool list 2>/dev/null)"
   { [ -z "$ZP" ] && sudo_ready; } && ZP="$(sq zpool list 2>/dev/null)"
   if [ -z "$ZP" ]; then
     printf -- '- ZFS is installed but there is no pool (or `zpool` needs root: %s)\n' "${SUDO_NOTE:-not determined}"
   else
     printf '```\n%s\n```\n' "$ZP"
     # `zpool status -x` 是一行式健康判定(全好只印 all pools are healthy),比整份 status 適合紀錄。
-    ZS="$(zpool status -x 2>/dev/null)"
+    ZS="$(tmo 10 zpool status -x 2>/dev/null)"
     { [ -z "$ZS" ] && sudo_ready; } && ZS="$(sq zpool status -x 2>/dev/null)"
     [ -n "$ZS" ] && printf -- '- **pool health** (`zpool status -x`)\n```\n%s\n```\n' "$ZS"
   fi
@@ -741,7 +744,7 @@ if lsblk -o FSTYPE 2>/dev/null | cat | grep -q btrfs; then
   if ! have btrfs; then
     note "btrfs partitions exist but there is no btrfs command, so the RAID profile cannot be read"
   else
-    BT="$(btrfs filesystem show 2>/dev/null)"
+    BT="$(tmo 10 btrfs filesystem show 2>/dev/null)"
     { [ -z "$BT" ] && sudo_ready; } && BT="$(sq btrfs filesystem show 2>/dev/null)"
     if [ -n "$BT" ]; then
       printf '```\n%s\n```\n' "$BT"
@@ -1040,10 +1043,10 @@ else
   kv "aetherSlide version TAG (configured)" "$(envval "$DEPLOY_DIR/.env" TAG)"
   if have docker; then
     # 只看自家 registry 的 image;redis 等第三方 image 的 tag 不是 aetherSlide 版本
-    RUNNING_TAG="$(docker ps --format '{{.Image}}' 2>/dev/null | grep -i aetherai |
+    RUNNING_TAG="$(tmo 8 docker ps --format '{{.Image}}' 2>/dev/null | grep -i aetherai |
       sed -n 's/.*:\([^:]*\)$/\1/p' | sort -u | paste -sd ', ' -)"
-    if [ -z "$RUNNING_TAG" ] && docker ps -q 2>/dev/null | grep -q .; then
-      RUNNING_TAG="$(docker ps --format '{{.Image}}' 2>/dev/null | sed -n 's/.*:\([^:]*\)$/\1/p' | sort -u | paste -sd ', ' -)(not our registry, please confirm)"
+    if [ -z "$RUNNING_TAG" ] && tmo 8 docker ps -q 2>/dev/null | grep -q .; then
+      RUNNING_TAG="$(tmo 8 docker ps --format '{{.Image}}' 2>/dev/null | sed -n 's/.*:\([^:]*\)$/\1/p' | sort -u | paste -sd ', ' -)(not our registry, please confirm)"
     fi
     kv "image tag actually running" "${RUNNING_TAG:-(no running container)}"
   fi
@@ -1057,7 +1060,7 @@ else
   [ -d "$DEPLOY_DIR/secrets" ] && kv "secrets/" "present (directory)"
   # 站台有幾十個容器,不健康的會混在清單裡看不到,所以先單獨拉出來當警示
   if have docker; then
-    BAD="$(docker ps --format '{{.Names}}\t{{.Status}}' 2>/dev/null |
+    BAD="$(tmo 8 docker ps --format '{{.Names}}\t{{.Status}}' 2>/dev/null |
       grep -iE 'restarting|unhealthy|health: starting|created|paused')"
     printf '<!--SEC:app.containers_unhealthy-->\n### Containers in an abnormal state (read this first)\n'
     if [ -n "$BAD" ]; then
@@ -1069,12 +1072,12 @@ else
   fi
   printf '<!--SEC:app.containers_running-->\n### Running containers (name / image / status / published ports)\n```\n'
   if have docker; then
-    docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || note "docker ps failed (permissions?)"
+    tmo 8 docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || note "docker ps failed (permissions? timed out?)"
   else note "no docker"; fi
   printf '```\n'
   # 只列最近 15 個。Exited (0) 多半是 init / volume 準備之類的一次性容器,屬正常
   if have docker; then
-    STOPPED="$(docker ps -a --filter 'status=exited' --filter 'status=dead' \
+    STOPPED="$(tmo 8 docker ps -a --filter 'status=exited' --filter 'status=dead' \
       --format '{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null | head -15)"
     printf '<!--SEC:app.containers_stopped-->\n### Stopped containers (Exited 0 is usually a one-shot init; only non-zero needs following up)\n'
     if [ -n "$STOPPED" ]; then printf '```\n%s\n```\n' "$STOPPED"; else printf -- '- None\n'; fi
@@ -1131,7 +1134,7 @@ else
     note "a deploy directory exists but kubectl / microk8s kubectl cannot reach the cluster (permissions? cluster down?); only config file contents are listed below"
   else
     kv "k8s command" "$KCTL"
-    have microk8s && kv "MicroK8s version" "$(microk8s version 2>/dev/null | head -1)"
+    have microk8s && kv "MicroK8s version" "$(tmo 10 microk8s version 2>/dev/null | head -1)"
   fi
 
   # ── 版本:三個來源要並列 ──
@@ -1139,7 +1142,7 @@ else
   printf '<!--SEC:ai.versions-->\n### Versions (three sources; they commonly disagree, read them together)\n'
   kv "Chart.yaml appVersion (deploy dir)" "$(yamlval "$AIL_DIR/charts/ai-landing/Chart.yaml" '^appVersion:')"
   if [ -n "$HELM" ]; then
-    HELM_OUT="$($HELM list -A 2>/dev/null)"
+    HELM_OUT="$(tmo 10 $HELM list -A 2>/dev/null)"
     if [ -n "$HELM_OUT" ]; then
       printf '```\n%s\n```\n' "$HELM_OUT"
     else
@@ -1193,7 +1196,7 @@ else
     NODE_N="$(kctl get nodes --no-headers | wc -l | tr -d ' ')"
     kv "Node count" "${NODE_N:-unknown} (1 = single node, >1 means workers were added)"
     # 實體 GPU 數 vs k8s 看到的 GPU 數:不一致就是 time-slicing 在切
-    PHYS_GPU="$(nvidia-smi -L 2>/dev/null | grep -c GPU)"
+    PHYS_GPU="$(tmo 10 nvidia-smi -L 2>/dev/null | grep -c GPU)"
     K8S_GPU="$(kctl get nodes -o 'custom-columns=G:.status.capacity.nvidia\.com/gpu' --no-headers | awk '$1 ~ /^[0-9]+$/ {s+=$1} END{print s+0}')"
     kv "Physical GPUs (nvidia-smi)" "${PHYS_GPU:-0}"
     kv "GPUs allocatable in k8s (capacity)" "${K8S_GPU:-0} (greater than the physical count = time-slicing is on)"
