@@ -16,8 +16,8 @@ set -euo pipefail
 
 REPO="DavidChangAndroid/aetherslide-tools"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OBSIDIAN_ROOT="/Users/davidchang/Library/Mobile Documents/iCloud~md~obsidian/Documents/iCloud_Obsidian/雲象科技"
-VAULT_ROOT="$OBSIDIAN_ROOT/08_工具與設定/小工具"
+OBSIDIAN_ROOT="${OBSIDIAN_ROOT:-$HOME/ObsidianVault/雲象科技}"
+VAULT_ROOT="${VAULT_ROOT:-$OBSIDIAN_ROOT/08_工具與設定/小工具}"
 
 # 工具設定:repo 子目錄名 → 正本資料夾 / 檔名前綴
 # 新增工具時在這裡加一行即可。
