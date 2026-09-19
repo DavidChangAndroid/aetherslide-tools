@@ -7,6 +7,47 @@
 # Run this once after each installation instead of hand-editing every limit.
 # Service limits stay independent "ceilings" (they may overlap / oversubscribe);
 # this only caps each one relative to this machine's size.
+#
+# V2.6: fixes a crash bug in the "no external internet access" branch of
+#   configure_site_settings(): commenting out WEB__MATOMO_BACKEND_LOCATION made the
+#   nginx container's Settings() (nginx/settings.py, a required str with no default)
+#   raise a pydantic ValidationError and crash-loop — confirmed on a real install
+#   (2026-08-13). Fix: point it at the IP literal 127.0.0.1:1 instead of commenting
+#   it out. nginx/web.conf.jinja renders this into a static `upstream { server X }`
+#   block that nginx resolves via system DNS at config-parse time; an IP literal
+#   needs no DNS, so nginx always starts regardless of internet access, and the
+#   tracking upstream just gets connection-refused per request (harmless).
+#
+# V2.5: replaces V2.4's A/B/C bucket model with ONE unified formula per service:
+#     value = max( scale_from(.env.example), tph_floor )
+#   - .env.example (sized for 64C/128G) is the scaling BASE for normal machines.
+#   - the "tph" (部北) profile is a per-service FLOOR calibrated for 4C/8G, so hot
+#     services (uwsgi/image-server/websocket) keep enough process count + headroom
+#     even when pure scaling would starve them. This encodes real per-service
+#     tuning that a flat scale/floor cannot.
+#   - CPU/process scale by cores (/64), MEM scales by RAM (/128); k = pct/100.
+#   - Below the 4C/8G minimum: print an English warning and scale the tph floor
+#     DOWN by the machine/4C8G ratio (no pct applied), best-effort only.
+#   Two hand-maintained tables (EX = example base, FL = tph floor) live in
+#   load_reference_tables(); update them when the upstream sample / tph profile
+#   changes.
+#
+# V2.7 (multi-version; targets 202605.x .. 202609.1+; collapses the set_full_mod fork):
+#   * Resource sizing is now VERSION-ADAPTIVE. The managed key set + example base
+#     values (EX) + kind are DISCOVERED at runtime from the deployed .env.example
+#     (verified: EX == .env.example). New services are auto-managed, renamed ones
+#     followed, removed ones dropped; the write phase already skips keys absent from
+#     the target .env, so an unmatched key just falls back to its default.
+#   * FL (per-service floor) is a snapshot of the LIVE tph .env — the values that
+#     actually run stably in production (the old hand-guessed floors were too low and
+#     caused start-up failures). It carries both the current tph key names and the
+#     202609 renamed/new keys mapped to the nearest tph service, so the same floor
+#     applies under either naming. Refresh load_fl_snapshot() when tph is re-tuned.
+#   * NEW step configure_module_switches(): ask Y/N (or read env override MOD_AIHUB /
+#     MOD_EDUCATION / MOD_STUDY / MOD_QC / MOD_REGI = 1|0) for the five front-end
+#     modules and write them to prefs.env; all five are always offered and the key is
+#     appended if the deployed prefs.env lacks it. Replaces set_full_mod_configV1.0.sh.
+#   * Falls back to a built-in 202609.1 base table if .env.example can't be read.
 
 if [ -z "${BASH_VERSION:-}" ]; then
     echo "Error: this script must be run with bash, not sh."
@@ -24,6 +65,7 @@ source "$dirpath/lib/env_utils.sh"
 ENV_FILE="$website_path/.env"
 CONFIGS_FILE="$website_path/configs.env"
 TIER_FILE="$website_path/configs/gigastore/tier_configs.yaml"
+PREFS_FILE="$website_path/prefs.env"
 
 # Defaults for the three knobs (percent).
 DEFAULT_CPU_PCT=80
@@ -32,7 +74,16 @@ DEFAULT_DISK_PCT=95
 
 declare -A ENV_UPDATES
 declare -A CONFIGS_UPDATES
+declare -A PREFS_UPDATES
 CONFIGS_COMMENT_OUT=()
+
+# Reference tables + regime flag, filled by discover_ref_keys() / compute_values().
+declare -A EX FL KIND FL_SNAP EX_BUILTIN
+REF_KEYS=()
+REF_KEYS_CPU=()
+REF_KEYS_MEM=()
+REF_KEYS_NUM=()
+BELOW_MIN=0
 
 main() {
     fix_default_data_paths
@@ -40,6 +91,7 @@ main() {
     check_disk_encryption
     check_storage_mounts
     configure_site_settings
+    configure_module_switches
     detect_hardware
     show_disk_usage
     prompt_percentages
@@ -259,22 +311,43 @@ check_storage_mounts() {
         echo
     fi
 
-    # vol001 under STORAGE_PATH must always exist.
-    local storage_raw storage_p vol001_path
+    # ── RD SOP: required storage sub-volumes and the 'share' mount ───────────
+    # Source: https://docs.google.com/document/d/1E_s7Wl_Ap2tjIOZYXK0Ro7H-5COdt6ikxzLWLzCcPd0/edit
+    # Per the RD install SOP these must exist before services start:
+    #   storage/vol001..vol003, upload/gw001..gw003, and a top-level 'share'
+    #   (which has no .env key of its own). Sub-volumes are created under the
+    #   resolved STORAGE_PATH / UPLOAD_PATH; 'share' sits alongside storage
+    #   (e.g. STORAGE_PATH=/data/storage -> /data/share). sudo, because /data is
+    #   typically a freshly-mounted root-owned external volume.
+    local storage_raw upload_raw storage_p upload_p d
     storage_raw=$(resolve_path_raw STORAGE_PATH)
+    upload_raw=$(resolve_path_raw UPLOAD_PATH)
+
     if [[ -n $storage_raw ]]; then
         if [[ $storage_raw == ./* || $storage_raw == . ]]; then
             storage_p="$website_path/${storage_raw#./}"
         else
             storage_p="$storage_raw"
         fi
-        vol001_path="$storage_p/vol001"
-
-        if [[ ! -d $vol001_path ]]; then
-            sudo mkdir -p "$vol001_path" && echo "[INFO] Created: $vol001_path"
+        for d in vol001 vol002 vol003; do
+            [[ -d "$storage_p/$d" ]] || { sudo mkdir -p "$storage_p/$d" && echo "[INFO] Created: $storage_p/$d"; }
+        done
+        if [[ ! -d "$(dirname "$storage_p")/share" ]]; then
+            sudo mkdir -p "$(dirname "$storage_p")/share" && echo "[INFO] Created: $(dirname "$storage_p")/share"
         fi
-        echo
     fi
+
+    if [[ -n $upload_raw ]]; then
+        if [[ $upload_raw == ./* || $upload_raw == . ]]; then
+            upload_p="$website_path/${upload_raw#./}"
+        else
+            upload_p="$upload_raw"
+        fi
+        for d in gw001 gw002 gw003; do
+            [[ -d "$upload_p/$d" ]] || { sudo mkdir -p "$upload_p/$d" && echo "[INFO] Created: $upload_p/$d"; }
+        done
+    fi
+    echo
 }
 
 detect_hardware() {
@@ -399,17 +472,30 @@ configure_site_settings() {
     echo
 
     # --- WEB__MATOMO_BACKEND_LOCATION ---
+    # nginx/settings.py declares this a REQUIRED str (no default) — commenting it out
+    # makes the nginx container's Settings() raise a pydantic ValidationError and
+    # crash-loop on every start, it does not just "hang". Confirmed the hard way on a
+    # real install (2026-08-13): commenting this out broke nginx immediately.
+    #
+    # nginx/web.conf.jinja renders it into a static `upstream { server X }` block,
+    # which nginx resolves via system DNS at config-parse time (not the in-container
+    # `resolver` directive, which only applies to variables). A hostname that fails to
+    # resolve (no DNS / no internet) makes nginx fail to start with "host not found in
+    # upstream" — THIS is what the "no external internet access" question is actually
+    # guarding against. So on "no internet", point it at a loopback IP literal instead
+    # of commenting it out: an IP literal never needs DNS, so nginx always starts; the
+    # tracking upstream just gets connection-refused per request (harmless).
     local cur_matomo
     cur_matomo=$(getenv WEB__MATOMO_BACKEND_LOCATION configs.env || true)
     echo "  WEB__MATOMO_BACKEND_LOCATION = $cur_matomo"
-    echo "  (external monitoring server — if unreachable, NGINX will hang on startup)"
+    echo "  (external monitoring server — settings.py requires this field; it cannot be blank/commented out)"
     local ans
     read -rp "  Does this server have external internet access? [Y/n]: " ans
     if [[ -z $ans || $ans =~ ^[Yy]$ ]]; then
         echo "  -> Keeping WEB__MATOMO_BACKEND_LOCATION unchanged."
     else
-        CONFIGS_COMMENT_OUT+=(WEB__MATOMO_BACKEND_LOCATION)
-        echo "  -> Will comment out WEB__MATOMO_BACKEND_LOCATION."
+        CONFIGS_UPDATES[WEB__MATOMO_BACKEND_LOCATION]="127.0.0.1:1"
+        echo "  -> No internet: pointing WEB__MATOMO_BACKEND_LOCATION at 127.0.0.1:1 (IP literal, no DNS needed, keeps nginx startable)."
     fi
     echo
 
@@ -463,70 +549,245 @@ configure_site_settings() {
     echo
 }
 
+# module_choice <env_value> <label> -> echoes 1 or 0
+#   Non-empty <env_value> is used non-interactively (1/Y/y/yes -> 1, else 0);
+#   otherwise prompt, defaulting to No.
+module_choice() {
+    local envval=$1 label=$2 ans
+    if [[ -n $envval ]]; then
+        case "$envval" in
+            1|Y|y|yes|YES) echo 1 ;;
+            *)             echo 0 ;;
+        esac
+        return
+    fi
+    read -rp "  Enable $label? [y/N]: " ans
+    [[ $ans =~ ^[Yy]$ ]] && echo 1 || echo 0
+}
+
+# configure_module_switches: ask (or read from env) whether to enable each of the
+# five optional front-end modules, staged into PREFS_UPDATES for prefs.env. All five
+# are always offered; the key is appended if prefs.env lacks it (see set_or_append_env).
+# 202609.1: these are UI-only toggles (no backend module / no MODULES= entry).
+configure_module_switches() {
+    echo "[INFO] Optional front-end modules (prefs.env). Default = No."
+    echo "       Non-interactive override via env: MOD_AIHUB / MOD_EDUCATION / MOD_STUDY / MOD_QC / MOD_REGI (1|0)."
+    echo
+    local v
+    v=$(module_choice "${MOD_AIHUB:-}"     "AI Hub (AI App page)");    PREFS_UPDATES[PREF__CAN_USE_AI_APP_PAGE]=$v;       echo "  -> AI Hub          = $v"
+    v=$(module_choice "${MOD_EDUCATION:-}" "Education");               PREFS_UPDATES[PREF__CAN_USE_EDUCATION]=$v;         echo "  -> Education       = $v"
+    v=$(module_choice "${MOD_STUDY:-}"     "Study Tool (Worklist)");   PREFS_UPDATES[PREF__CAN_USE_STUDY_TOOL]=$v;        echo "  -> Study Tool      = $v"
+    v=$(module_choice "${MOD_QC:-}"        "Quality Control");         PREFS_UPDATES[PREF__CAN_USE_QUALITY_CONTROL]=$v;   echo "  -> Quality Control = $v"
+    v=$(module_choice "${MOD_REGI:-}"      "Registration Tool");       PREFS_UPDATES[PREF__CAN_USE_REGISTRATION_TOOL]=$v; echo "  -> Registration    = $v"
+    echo
+}
+
+# rdiv <num> <den> -> integer round(num/den)
+rdiv() {
+    echo $(( ( $1 + $2 / 2 ) / $2 ))
+}
+
+
+# load_fl_snapshot -> FL floors: a snapshot of the LIVE tph .env resource limits
+# (the values that actually run stably in production; the previous hand-guessed
+# floors were too low and caused start-up failures). Refresh whenever tph is
+# re-tuned. Carries BOTH the current tph key names AND the 202609 renamed/new keys,
+# each mapped to the nearest tph service, so the same floor applies under either
+# naming:  IMAGE_ANALYSIS_SERVER_* <- IMAGE_ANALYSIS_WORKER_* (tph);
+#          CLINICAL_FILE_IMPORT_*  <- AUTOIMPORT (tph).
+# (mem values are integers in GB; the "g" suffix is added at write time.)
+load_fl_snapshot() {
+    FL_SNAP=(
+        [UWSGI_CPUS_LIMIT]=4 [IMAGE_SERVER_CPUS_LIMIT]=6 [NGINX_CPUS_LIMIT]=1
+        [WEBSOCKET_CPUS_LIMIT]=1 [DATABASE_CPUS_LIMIT]=4 [WORKER_CPUS_LIMIT]=1
+        [WORKER_SERIAL_CPUS_LIMIT]=1 [HL7V2_SERVER_CPUS_LIMIT]=1 [IMAGE_SERVER_WORKER_CPUS_LIMIT]=1
+        [IMAGE_ANALYSIS_WORKER_CPUS_LIMIT]=2 [IMAGE_ANALYSIS_SERVER_CPUS_LIMIT]=2 [CLINICAL_FILE_IMPORT_CPUS_LIMIT]=1
+        [IMAGE_SERVER_HIGH_PRIORITY_WORKER_CPUS_LIMIT]=3 [IMAGE_SERVER_BACKGROUND_WORKER_CPUS_LIMIT]=3
+        [MRXS_SERVER_CPUS_LIMIT]=4 [DICOM_SCP_CPUS_LIMIT]=2 [AUTOIMPORT_CPUS_LIMIT]=1
+        [RABBITMQ_CPUS_LIMIT]=4 [REDIS_CPUS_LIMIT]=4 [CADDY_CPUS_LIMIT]=1
+        [CRONTAB_WORKER_CPUS_LIMIT]=1 [SELF_CHECK_CPUS_LIMIT]=1
+        [UWSGI_MEM_LIMIT]=4 [IMAGE_SERVER_MEM_LIMIT]=8 [IMAGE_ANALYSIS_WORKER_MEM_LIMIT]=2
+        [IMAGE_ANALYSIS_SERVER_MEM_LIMIT]=2 [CLINICAL_FILE_IMPORT_MEM_LIMIT]=1 [HL7V2_SERVER_MEM_LIMIT]=5
+        [DATABASE_MEM_LIMIT]=4 [IMAGE_SERVER_WORKER_MEM_LIMIT]=1 [WORKER_MEM_LIMIT]=10
+        [WORKER_SERIAL_MEM_LIMIT]=10 [WEBSOCKET_MEM_LIMIT]=1 [AUTOIMPORT_MEM_LIMIT]=1
+        [REDIS_MEM_LIMIT]=10 [MRXS_SERVER_MEM_LIMIT]=8 [IMAGE_SERVER_HIGH_PRIORITY_WORKER_MEM_LIMIT]=6
+        [IMAGE_SERVER_BACKGROUND_WORKER_MEM_LIMIT]=6 [NGINX_MEM_LIMIT]=1 [CADDY_MEM_LIMIT]=2
+        [RABBITMQ_MEM_LIMIT]=2 [DICOM_SCP_MEM_LIMIT]=4 [CRONTAB_WORKER_MEM_LIMIT]=2 [SELF_CHECK_MEM_LIMIT]=2
+        [UWSGI_PROCESS_NUMBER]=4 [IMAGE_SERVER_PROCESS_NUMBER]=6 [WEBSOCKET_PROCESS_NUMBER]=2
+        [MRXS_SERVER_PROCESS_NUMBER]=8 [WEB_WORKER_CONCURRENCY]=1 [WEB_IMAGE_SERVER_WORKER_CONCURRENCY]=1
+        [IMAGE_ANALYSIS_WORKER_CONCURRENCY]=4 [IMAGE_ANALYSIS_SERVER_PROCESS_NUMBER]=2
+        [WEB_IMAGE_SERVER_BACKGROUND_WORKER_CONCURRENCY]=4 [GIGASTORE_WORKER_CONCURRENCY]=1
+    )
+}
+
+# load_builtin_ex_table -> fallback EX (example base), a snapshot of 202609.1
+# .env.example. Used ONLY when the deployed .env.example cannot be read.
+load_builtin_ex_table() {
+    EX_BUILTIN=(
+        [UWSGI_CPUS_LIMIT]=22 [IMAGE_SERVER_CPUS_LIMIT]=16 [NGINX_CPUS_LIMIT]=4 [WEBSOCKET_CPUS_LIMIT]=4
+        [DATABASE_CPUS_LIMIT]=8 [WORKER_CPUS_LIMIT]=8 [WORKER_SERIAL_CPUS_LIMIT]=1 [HL7V2_SERVER_CPUS_LIMIT]=8
+        [IMAGE_SERVER_WORKER_CPUS_LIMIT]=8 [IMAGE_ANALYSIS_SERVER_CPUS_LIMIT]=4 [CLINICAL_FILE_IMPORT_CPUS_LIMIT]=4
+        [IMAGE_SERVER_HIGH_PRIORITY_WORKER_CPUS_LIMIT]=8 [IMAGE_SERVER_BACKGROUND_WORKER_CPUS_LIMIT]=8
+        [MRXS_SERVER_CPUS_LIMIT]=4 [DICOM_SCP_CPUS_LIMIT]=2 [AUTOIMPORT_CPUS_LIMIT]=4 [RABBITMQ_CPUS_LIMIT]=4
+        [REDIS_CPUS_LIMIT]=4 [CADDY_CPUS_LIMIT]=4 [CRONTAB_WORKER_CPUS_LIMIT]=1 [SELF_CHECK_CPUS_LIMIT]=1
+        [UWSGI_MEM_LIMIT]=60 [IMAGE_SERVER_MEM_LIMIT]=32 [IMAGE_ANALYSIS_SERVER_MEM_LIMIT]=32 [CLINICAL_FILE_IMPORT_MEM_LIMIT]=8
+        [HL7V2_SERVER_MEM_LIMIT]=60 [DATABASE_MEM_LIMIT]=32 [IMAGE_SERVER_WORKER_MEM_LIMIT]=32 [WORKER_MEM_LIMIT]=10
+        [WORKER_SERIAL_MEM_LIMIT]=10 [WEBSOCKET_MEM_LIMIT]=6 [AUTOIMPORT_MEM_LIMIT]=8 [REDIS_MEM_LIMIT]=10
+        [MRXS_SERVER_MEM_LIMIT]=8 [IMAGE_SERVER_HIGH_PRIORITY_WORKER_MEM_LIMIT]=32 [IMAGE_SERVER_BACKGROUND_WORKER_MEM_LIMIT]=32
+        [NGINX_MEM_LIMIT]=2 [CADDY_MEM_LIMIT]=2 [RABBITMQ_MEM_LIMIT]=2 [DICOM_SCP_MEM_LIMIT]=4
+        [CRONTAB_WORKER_MEM_LIMIT]=2 [SELF_CHECK_MEM_LIMIT]=2
+        [UWSGI_PROCESS_NUMBER]=20 [IMAGE_SERVER_PROCESS_NUMBER]=20 [WEBSOCKET_PROCESS_NUMBER]=4 [MRXS_SERVER_PROCESS_NUMBER]=8
+        [IMAGE_ANALYSIS_SERVER_PROCESS_NUMBER]=2 [WEB_WORKER_CONCURRENCY]=8 [WEB_IMAGE_SERVER_WORKER_CONCURRENCY]=4
+        [WEB_IMAGE_SERVER_BACKGROUND_WORKER_CONCURRENCY]=4 [GIGASTORE_WORKER_CONCURRENCY]=2
+    )
+}
+
+# kind_of <KEY> -> cpu|mem|num|"" (by suffix)
+kind_of() {
+    case "$1" in
+        *_CPUS_LIMIT)                    echo cpu ;;
+        *_MEM_LIMIT)                     echo mem ;;
+        *_PROCESS_NUMBER|*_CONCURRENCY)  echo num ;;
+        *)                               echo "" ;;
+    esac
+}
+
+# num_prefix <val> -> leading integer ("10g" -> 10, "32" -> 32)
+num_prefix() { local v=$1; v=${v%%[!0-9]*}; echo "${v:-0}"; }
+
+# discover_ref_keys -> fill EX / KIND / FL / REF_KEYS (+ per-kind ordered lists) by
+# scanning the DEPLOYED .env.example, so the managed key set + base values track the
+# installed version. Falls back to the built-in 202609.1 table if unreadable.
+discover_ref_keys() {
+    local example="$website_path/.env.example"
+    local line key val kind
+    if [[ -r $example ]]; then
+        echo "[INFO] Sizing base: $example (managed keys derived from the deployed version)."
+        while IFS= read -r line; do
+            [[ $line =~ ^[A-Z0-9_]+= ]] || continue
+            key=${line%%=*}
+            kind=$(kind_of "$key")
+            [[ -n $kind ]] || continue
+            val=$(num_prefix "${line#*=}")
+            EX[$key]=$val; KIND[$key]=$kind; REF_KEYS+=("$key")
+            case "$kind" in
+                cpu) REF_KEYS_CPU+=("$key") ;;
+                mem) REF_KEYS_MEM+=("$key") ;;
+                num) REF_KEYS_NUM+=("$key") ;;
+            esac
+        done < "$example"
+    fi
+    if ((${#REF_KEYS[@]} == 0)); then
+        echo "[WARN] $example not readable — using the built-in 202609.1 base table." >&2
+        load_builtin_ex_table
+        for key in "${!EX_BUILTIN[@]}"; do
+            EX[$key]=${EX_BUILTIN[$key]}; KIND[$key]=$(kind_of "$key"); REF_KEYS+=("$key")
+        done
+        local sk
+        for sk in $(printf '%s
+' "${REF_KEYS[@]}" | sort); do
+            case "$(kind_of "$sk")" in
+                cpu) REF_KEYS_CPU+=("$sk") ;;
+                mem) REF_KEYS_MEM+=("$sk") ;;
+                num) REF_KEYS_NUM+=("$sk") ;;
+            esac
+        done
+    fi
+    # FL floor from the tph snapshot; a key with no tph analog gets a 1 insurance floor.
+    for key in "${REF_KEYS[@]}"; do
+        FL[$key]=${FL_SNAP[$key]:-1}
+    done
+}
+
 compute_values() {
-    local cpu_full=$((CORES * CPU_PCT / 100))
-    local cpu_half=$((CORES * CPU_PCT / 200))
-    local mem_full=$((RAM_GB * RAM_PCT / 100))
-    local mem_half=$((RAM_GB * RAM_PCT / 200))
-    ((cpu_full < 1)) && cpu_full=1
-    ((cpu_half < 1)) && cpu_half=1
-    ((mem_full < 1)) && mem_full=1
-    ((mem_half < 1)) && mem_half=1
+    # Unified per-service sizing (see file header):
+    #   value = max( round(example_base * machine_ratio * k), tph_floor )
+    # with machine_ratio = CORES/64 (cpu, process) or RAM_GB/128 (mem), k = pct/100.
+    # Below the 4C/8G minimum, the tph floor becomes the base and is scaled DOWN by
+    # the machine/4C8G ratio (no k), after an English warning.
+    local BASE_CORES=64 BASE_RAM_GB=128 MIN_CORES=4 MIN_RAM_GB=8
 
-    # Bucket A: flagship, full cap
-    ENV_UPDATES[UWSGI_CPUS_LIMIT]=$cpu_full
-    ENV_UPDATES[IMAGE_SERVER_CPUS_LIMIT]=$cpu_full
-    ENV_UPDATES[UWSGI_MEM_LIMIT]=${mem_full}g
-    ENV_UPDATES[IMAGE_SERVER_MEM_LIMIT]=${mem_full}g
-    ENV_UPDATES[IMAGE_ANALYSIS_WORKER_MEM_LIMIT]=${mem_full}g
-    ENV_UPDATES[HL7V2_SERVER_MEM_LIMIT]=${mem_full}g
+    load_fl_snapshot
+    discover_ref_keys
 
-    # Bucket B: major, half cap
-    ENV_UPDATES[DATABASE_CPUS_LIMIT]=$cpu_half
-    ENV_UPDATES[WORKER_CPUS_LIMIT]=$cpu_half
-    ENV_UPDATES[HL7V2_SERVER_CPUS_LIMIT]=$cpu_half
-    ENV_UPDATES[IMAGE_SERVER_WORKER_CPUS_LIMIT]=$cpu_half
-    ENV_UPDATES[CADDY_CPUS_LIMIT]=$cpu_half
-    ENV_UPDATES[DATABASE_MEM_LIMIT]=${mem_half}g
-    ENV_UPDATES[IMAGE_SERVER_WORKER_MEM_LIMIT]=${mem_half}g
+    BELOW_MIN=0
+    if (( CORES < MIN_CORES || RAM_GB < MIN_RAM_GB )); then
+        BELOW_MIN=1
+        cat >&2 <<EOF
 
-    # process / concurrency, aligned to each service's bucket
-    ENV_UPDATES[UWSGI_PROCESS_NUMBER]=$cpu_full
-    ENV_UPDATES[IMAGE_SERVER_PROCESS_NUMBER]=$cpu_full
-    ENV_UPDATES[WEB_WORKER_CONCURRENCY]=$cpu_half
-    ENV_UPDATES[WEB_IMAGE_SERVER_WORKER_CONCURRENCY]=$cpu_half
+WARNING: Detected hardware (${CORES} cores / ${RAM_GB} GB RAM) is below the
+recommended minimum of ${MIN_CORES} cores / ${MIN_RAM_GB} GB. aetherSlide will
+very likely hit out-of-memory conditions and be unstable on this machine.
+The reference minimum (tph) profile will be scaled down to fit, but this setup
+is NOT recommended for production. Proceed at your own risk.
+
+EOF
+    fi
+
+    local k base_ex base_fl kind val
+    for k in "${REF_KEYS[@]}"; do
+        base_ex=${EX[$k]}
+        base_fl=${FL[$k]}
+        kind=${KIND[$k]}
+
+        if (( BELOW_MIN )); then
+            # tph floor is the base; scale down by machine / 4C8G ratio, no pct.
+            if [[ $kind == mem ]]; then
+                val=$(rdiv $(( base_fl * RAM_GB )) "$MIN_RAM_GB")
+            else
+                val=$(rdiv $(( base_fl * CORES )) "$MIN_CORES")
+            fi
+            (( val < 1 )) && val=1
+        else
+            # scale from .env.example, then never drop below the tph floor.
+            if [[ $kind == mem ]]; then
+                val=$(rdiv $(( base_ex * RAM_GB * RAM_PCT )) $(( BASE_RAM_GB * 100 )))
+            else
+                val=$(rdiv $(( base_ex * CORES * CPU_PCT )) $(( BASE_CORES * 100 )))
+            fi
+            (( val < base_fl )) && val=$base_fl
+        fi
+
+        # A CPU limit can never exceed the physical core count.
+        [[ $kind == cpu ]] && (( val > CORES )) && val=$CORES
+
+        if [[ $kind == mem ]]; then
+            ENV_UPDATES[$k]="${val}g"
+        else
+            ENV_UPDATES[$k]=$val
+        fi
+    done
 }
 
 show_plan() {
     echo "[INFO] Planned changes ($ENV_FILE):"
-    printf "       %-40s %-12s -> %-12s\n" "VARIABLE" "CURRENT" "NEW"
+    if (( BELOW_MIN )); then
+        echo "       (basis: tph minimum profile scaled down to ${CORES}C/${RAM_GB}G — BELOW the recommended 4C/8G minimum)"
+    else
+        echo "       (basis: .env.example scaled to ${CORES}C/${RAM_GB}G @ CPU ${CPU_PCT}% / RAM ${RAM_PCT}%, floored at the tph minimum)"
+    fi
+    printf "       %-48s %-12s -> %-12s\n" "VARIABLE" "CURRENT" "NEW"
     # Data path fixes (./data/* -> /data/*), recorded earlier as planned changes.
     local pk
     for pk in STORAGE_PATH BACKUP_PATH UPLOAD_PATH EXPORT_PATH EXPORT_EXTERNAL_PATH DATASET_EXPORT_PATH; do
         [[ -n ${ENV_UPDATES[$pk]:-} ]] || continue
-        printf "       %-40s %-12s -> %-12s\n" "$pk" "$(current_env "$pk")" "${ENV_UPDATES[$pk]}"
+        printf "       %-48s %-12s -> %-12s\n" "$pk" "$(current_env "$pk")" "${ENV_UPDATES[$pk]}"
     done
-    # stable, grouped ordering
-    local keys=(
-        UWSGI_CPUS_LIMIT IMAGE_SERVER_CPUS_LIMIT
-        UWSGI_MEM_LIMIT IMAGE_SERVER_MEM_LIMIT IMAGE_ANALYSIS_WORKER_MEM_LIMIT HL7V2_SERVER_MEM_LIMIT
-        DATABASE_CPUS_LIMIT WORKER_CPUS_LIMIT HL7V2_SERVER_CPUS_LIMIT IMAGE_SERVER_WORKER_CPUS_LIMIT CADDY_CPUS_LIMIT
-        DATABASE_MEM_LIMIT IMAGE_SERVER_WORKER_MEM_LIMIT
-        UWSGI_PROCESS_NUMBER IMAGE_SERVER_PROCESS_NUMBER WEB_WORKER_CONCURRENCY WEB_IMAGE_SERVER_WORKER_CONCURRENCY
-    )
-    local k cur new
-    for k in "${keys[@]}"; do
+    # dynamic ordering: CPU limits, then MEM, then process/concurrency (discovery order)
+    local k cur new flag
+    for k in "${REF_KEYS_CPU[@]}" "${REF_KEYS_MEM[@]}" "${REF_KEYS_NUM[@]}"; do
         cur=$(current_env "$k")
         new=${ENV_UPDATES[$k]}
-        local flag=""
+        flag=""
         [[ $cur == "$new" ]] && flag="(unchanged)"
-        printf "       %-40s %-12s -> %-12s %s\n" "$k" "$cur" "$new" "$flag"
+        printf "       %-48s %-12s -> %-12s %s
+" "$k" "$cur" "$new" "$flag"
     done
 
     echo
     echo "[INFO] Planned changes ($CONFIGS_FILE):"
     printf "       %-45s %-32s -> %s\n" "VARIABLE" "CURRENT" "NEW"
-    local ckeys=(WEB_NETWORK_LOCATION WEB_BACKEND__ALLOWED_HOSTS AI_LANDING_URL WEB_BACKEND__SITE_LICENSE_LIMIT SMTP_HOST SMTP_PORT EMAIL_RECEIVER)
+    local ckeys=(WEB_NETWORK_LOCATION WEB_BACKEND__ALLOWED_HOSTS WEB__MATOMO_BACKEND_LOCATION AI_LANDING_URL WEB_BACKEND__SITE_LICENSE_LIMIT SMTP_HOST SMTP_PORT EMAIL_RECEIVER)
     local ck ccur cnew cflag
     for ck in "${ckeys[@]}"; do
         ccur=$(getenv "$ck" configs.env || true)
@@ -538,6 +799,18 @@ show_plan() {
     for ck in "${CONFIGS_COMMENT_OUT[@]}"; do
         ccur=$(getenv "$ck" configs.env || true)
         printf "       %-45s %-32s -> %s\n" "$ck" "$ccur" "(commented out)"
+    done
+    echo
+    echo "[INFO] Planned changes ($PREFS_FILE):"
+    printf "       %-45s %-12s -> %-12s\n" "VARIABLE" "CURRENT" "NEW"
+    local pkk pcur pnew pflag
+    for pkk in PREF__CAN_USE_AI_APP_PAGE PREF__CAN_USE_EDUCATION PREF__CAN_USE_STUDY_TOOL PREF__CAN_USE_QUALITY_CONTROL PREF__CAN_USE_REGISTRATION_TOOL; do
+        pcur=$(getenv "$pkk" prefs.env 2>/dev/null || true)
+        pnew=${PREFS_UPDATES[$pkk]}
+        pflag=""
+        [[ $pcur == "$pnew" ]] && pflag="(unchanged)"
+        [[ -z $pcur ]] && pflag="(will append)"
+        printf "       %-45s %-12s -> %-12s %s\n" "$pkk" "$pcur" "$pnew" "$pflag"
     done
     echo
     echo "[INFO] Planned changes ($TIER_FILE):"
@@ -554,11 +827,18 @@ current_env() {
 
 confirm_and_apply() {
     local ans
-    read -rp "Apply changes? Consider running ./bin/backup_config_files.sh first. [Y/n]: " ans
+    read -rp "Apply changes? (target files are backed up first) [Y/n]: " ans
     if [[ -n $ans && ! $ans =~ ^[Yy]$ ]]; then
         echo "[INFO] Cancelled, no changes written."
         exit 0
     fi
+
+    # Back up every file we are about to modify, timestamped, before writing.
+    local ts f
+    ts=$(date +%Y%m%d%H%M%S)
+    for f in "$ENV_FILE" "$CONFIGS_FILE" "$PREFS_FILE" "$TIER_FILE"; do
+        [[ -f $f ]] && cp -p "$f" "$f.bak.$ts" && echo "[INFO] Backed up: $f -> $f.bak.$ts"
+    done
 
     local key
     for key in "${!ENV_UPDATES[@]}"; do
@@ -574,6 +854,11 @@ confirm_and_apply() {
         comment_out_env "$key" "$CONFIGS_FILE"
     done
 
+    # prefs.env: front-end module switches (append the key if it is missing)
+    for key in "${!PREFS_UPDATES[@]}"; do
+        set_or_append_env "$key" "${PREFS_UPDATES[$key]}" "$PREFS_FILE"
+    done
+
     # gigastore disk limit
     if grep -qE "max_percent:" "$TIER_FILE"; then
         sed -i -E "s|(max_percent:[[:space:]]*)[0-9]+|\1$DISK_PCT|" "$TIER_FILE"
@@ -581,7 +866,7 @@ confirm_and_apply() {
         echo "[WARN] max_percent not found in $TIER_FILE, skipping." >&2
     fi
 
-    echo "[INFO] Done. Review $ENV_FILE, $CONFIGS_FILE and $TIER_FILE before starting services."
+    echo "[INFO] Done. Review $ENV_FILE, $CONFIGS_FILE, $PREFS_FILE and $TIER_FILE before starting services."
 }
 
 # comment_out_env <key> <file>
@@ -640,6 +925,21 @@ run_populate_working_dir() {
         echo "[INFO] default login = superuser, password=$su_pass"
     else
         echo "[WARN] $su_pass_file not found — superuser password unavailable." >&2
+    fi
+}
+
+# set_or_append_env <key> <value> <file> -> update if present (or commented),
+# otherwise append. Used for the module switches so a version whose prefs.env lacks
+# the key still gets it set.
+set_or_append_env() {
+    local key=$1 val=$2 file=$3
+    if grep -q "^$key=" "$file"; then
+        sed -i "s|^$key=.*|$key=$val|" "$file"
+    elif grep -q "^#$key=" "$file"; then
+        sed -i "s|^#$key=.*|$key=$val|" "$file"
+    else
+        printf '%s=%s\n' "$key" "$val" >> "$file"
+        echo "[INFO] $key was absent in $(basename "$file") — appended." >&2
     fi
 }
 
