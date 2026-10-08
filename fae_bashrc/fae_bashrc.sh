@@ -1,45 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- Without --local: ask for hosts and run this script there via ssh --------
+# --- Which host? (same prompt as collect_site_config v1.19) -----------------
+# No arguments + a terminal: ask Host. Enter = install on this machine;
+# IPs = install on those hosts over ssh (not here), then exit.
+# No terminal (e.g. piped) = install here, as before v0.52.
 # The installer never reads stdin, so the whole file is piped to `bash -s`:
 # one ssh connection per host, no temp file left on the target.
-DEFAULT_USER="aetherai"
 case "${1:-}" in
   --local) ;;
   "")
-    echo "fae_bashrc: install the FAE shell environment on remote hosts."
-    echo "Enter host IPs (space or comma separated). Default user is ${DEFAULT_USER}; use user@ip to override."
-    echo "fae_bashrc is installed into that user's ~/.bashrc."
-    read -r -p "Hosts: " hosts
-    hosts="$(echo "${hosts}" | tr ',' ' ')"
-    [[ -n "${hosts// /}" ]] || { echo "No host given."; exit 1; }
-    failed=""
-    for target in ${hosts}; do
-      [[ "${target}" == *@* ]] || target="${DEFAULT_USER}@${target}"
-      echo
-      echo "=== ${target} (you may be asked for the ssh password) ==="
-      if ssh "${target}" 'bash -s -- --local' < "$0"; then
-        echo "Done: ${target}"
-      else
-        echo "FAILED: ${target}"
-        failed+=" ${target}"
+    if [[ -t 0 && -t 2 && -r "$0" ]]; then
+      printf '[fae_bashrc] Host to install on: press Enter for this host, or enter IPs (space or comma separated;\n' >&2
+      printf '[fae_bashrc] default account %s, use user@ip to change it) to install on them from here over ssh.\n' "$(id -un)" >&2
+      printf '[fae_bashrc] Host [this host]: ' >&2
+      IFS= read -r hosts || hosts=""
+      hosts="$(printf '%s' "${hosts}" | tr ',' ' ')"
+      if [[ -n "${hosts//[[:space:]]/}" ]]; then
+        failed=""
+        for target in ${hosts}; do
+          printf '\n[fae_bashrc] ===== %s (you may be asked for the ssh password) =====\n' "${target}" >&2
+          if ssh "${target}" 'bash -s -- --local' < "$0"; then
+            echo "Done: ${target}"
+          else
+            echo "FAILED: ${target}"
+            failed+=" ${target}"
+          fi
+        done
+        [[ -z "${failed}" ]] || { echo; echo "Failed hosts:${failed}"; exit 1; }
+        exit 0
       fi
-    done
-    [[ -z "${failed}" ]] || { echo; echo "Failed hosts:${failed}"; exit 1; }
-    exit 0 ;;
+    fi ;;
   *)
     echo "Usage:"
-    echo "  bash $0           ask for host IPs, install on each via ssh"
-    echo "  bash $0 --local   install on this machine"
+    echo "  bash $0           ask Host: Enter = install here, IPs = install on them via ssh"
+    echo "  bash $0 --local   install on this machine without asking"
     exit 1 ;;
 esac
 
 # =============================================================================
-# fae_bashrc installer (v0.52)
+# fae_bashrc installer (v0.53)
 #
-#     bash fae_bashrc.sh          # asks for host IPs, installs on each via ssh
-#     bash fae_bashrc.sh --local  # installs on THIS machine (backs up, migrates)
+#     bash fae_bashrc.sh          # asks Host: Enter = install here, IPs = install there via ssh
+#     bash fae_bashrc.sh --local  # installs on THIS machine without asking (backs up, migrates)
 #
 # fae_bashrc OWNS ~/.bashrc: it is replaced wholesale so every FAE machine runs
 # one identical shell environment. v0.5 adds the missing half of that deal — the
@@ -151,7 +154,7 @@ if [[ -n "${migrate_from}" ]]; then
     echo "# ~/.bashrc.local — your own shell customizations (aliases, PATH, conda/nvm)."
     echo "#"
     echo "# Migrated from ${migrate_from}"
-    echo "# by fae_bashrc v0.52 on $(date '+%F %T')."
+    echo "# by fae_bashrc v0.53 on $(date '+%F %T')."
     echo "#"
     echo "# fae_bashrc sources this file on every interactive login and NEVER rewrites"
     echo "# it again — it is yours. Upgrading fae_bashrc will not touch it."
@@ -176,15 +179,15 @@ fi
 
 cat > "${target_file}" <<'FAE_BASHRC_EOF'
 #!/usr/bin/env bash
-# fae_bashrc-managed v0.52
+# fae_bashrc-managed v0.53
 # =============================================================================
-# fae_bashrc  (v0.52) — the standardized FAE ~/.bashrc, input-only capture
+# fae_bashrc  (v0.53) — the standardized FAE ~/.bashrc, input-only capture
 #
 # FAE on-site shell environment for hospital production machines. The installer
 # backs up the current ~/.bashrc and installs this file in its place, so every
 # FAE machine runs one identical, unified shell environment.
 #
-#     bash fae_bashrc.sh          # asks for host IPs, installs on each via ssh
+#     bash fae_bashrc.sh          # asks Host: Enter = install here, IPs = install there via ssh
 #
 # v0.4 replaced v0.2/v0.3's whole-screen `script` recording with an INPUT-ONLY
 # capture model. The risk was that recording the whole pty wrote patient PHI
