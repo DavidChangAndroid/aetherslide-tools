@@ -29,6 +29,7 @@ vault_dir_for() {
     install_recorder) echo "專案錄影" ;;
     chrome_debug)     echo "Chrome_debug" ;;
     fae_bashrc)       echo "FAE_bashrc" ;;
+    nginx_latency)    echo "nginx_latency" ;;
     # 正本跟著「客戶 site config 紀錄」專案走,不在小工具庫
     site_config_collector) echo "$OBSIDIAN_ROOT/02_技術產品/專案/客戶 site_config 紀錄/採集腳本" ;;
     *) echo "" ;;
@@ -40,6 +41,7 @@ file_prefix_for() {
     install_recorder) echo "install_recorder" ;;
     chrome_debug)     echo "chrome_debug" ;;
     fae_bashrc)       echo "fae_bashrc" ;;
+    nginx_latency)    echo "nginx_latency" ;;
     site_config_collector) echo "collect_site_config" ;;
     *) echo "" ;;
   esac

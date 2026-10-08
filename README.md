@@ -34,5 +34,6 @@ The script selects the highest versioned source file, copies it into this reposi
 | `install_recorder` | Terminal recording and diff capture. |
 | `chrome_debug` | Capture a Chrome bug report. |
 | `site_config_collector` | Read-only site environment collector. |
+| `nginx_latency` | Per-hour search / tile timings from the aetherSlide nginx log (read-only). |
 
 To add a tool, add its source directory and filename prefix to `publish.sh` in `vault_dir_for` and `file_prefix_for`.
