@@ -31,7 +31,7 @@ vault_dir_for() {
     fae_bashrc)       echo "FAE_bashrc" ;;
     nginx_latency)    echo "nginx_latency" ;;
     # 正本跟著「客戶 site config 紀錄」專案走,不在小工具庫
-    site_config_collector) echo "$OBSIDIAN_ROOT/02_技術產品/專案/客戶 site_config 紀錄/採集腳本" ;;
+    site_config_collector) echo "$OBSIDIAN_ROOT/02_技術產品/專案/客戶 site_context 紀錄/採集腳本" ;;
     *) echo "" ;;
   esac
 }
