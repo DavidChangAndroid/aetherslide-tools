@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# collect_site_config.sh v1.18 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 site config 站頁。
+# collect_site_config.sh v1.19 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 site config 站頁。
 # v1.18 hardware / enclosure additions are unverified on real RAID hardware.
 # 2026-08-07 起**報告輸出全部英文**(國外 FAE 也要用);shell 註解仍保持中文(給維護者看)。
 #
 # 常態用法(零參數):
 #   bash collect.sh
 # 報告直接印在螢幕上,**不落地檔案**;起訖標記走 stderr,自己從螢幕框起來複製。
+# v1.19:零參數時先問 Host —— Enter = 採本機;輸入 IP = 從這台 ssh 過去採那幾台(不採本機),採完就結束。
 
 
 set -u
 SELF="${BASH_SOURCE[0]:-}"
+ARGC=$#
 # 第 9 段印指令時要用檔名(使用者貼進客戶機器時常改名成 collect.sh)
 SCRIPT_NAME="$(basename -- "$SELF" 2>/dev/null)"
 [ -n "$SCRIPT_NAME" ] || SCRIPT_NAME="collect.sh"
@@ -32,10 +34,11 @@ while [ $# -gt 0 ]; do
       [ -n "$PEER" ] || { echo "--peer requires [user@]host" >&2; exit 2; }
       shift 2 ;;
     -h|--help)
-      printf '%s v1.18 — read-only capture of a customer site environment; prints Markdown to paste into the site config page.\n\n' "$SCRIPT_NAME"
+      printf '%s v1.19 — read-only capture of a customer site environment; prints Markdown to paste into the site config page.\n\n' "$SCRIPT_NAME"
       printf '  bash %s [deploy-dir]            defaults to ~/website. The report is printed to the screen, no file is written\n' "$SCRIPT_NAME"
       printf '  bash %s --peer [user@]host      only prints the command to run this script on that host, then exits; does not capture this host\n' "$SCRIPT_NAME"
       printf '  bash %s --ai-landing-dir DIR    set this when AI Landing is not auto-detected\n\n' "$SCRIPT_NAME"
+      printf 'Without arguments you are asked for Host first: Enter = capture this host; IPs (user@ip to change the account) = capture\nthose hosts from here over ssh instead, then exit.\n\n'
       printf '  --with-sudo / --no-remote       no-ops since v1.13 (kept so commands in older docs do not error)\n\n'
       printf 'You are asked for the sudo password once (Enter, or no input for 10s = skip). Usage details, design rationale and change history: see the collector notes doc.\n'
       exit 0 ;;
@@ -69,6 +72,40 @@ if [ -n "$PEER" ]; then
   printf 'K=~/.ssh/id_rsa; P=%s; ssh -i $K $P '\''cat > /tmp/c.sh'\'' < %s && ssh -i $K -t $P '\''bash /tmp/c.sh; rm -f /tmp/c.sh'\''\n' \
     "$PEER" "$SCRIPT_NAME"
   exit 0
+fi
+
+# ── 零參數:先問要採哪台(v1.19)──────
+# Enter = 本機(往下照舊);輸入 IP = 從這台 ssh 過去採那幾台,不採本機,採完就結束。
+# 遠端跑法:腳本先傳到對方 /tmp,再 ssh -t 執行(有 pty 對方 sudo 才問得到密碼),跑完刪掉。
+# 不用 `ssh host 'bash -s' < 腳本`:那樣對方沒有 tty,sudo 一律不問,root 欄位全空。
+# 金鑰走這台 ~/.ssh 的預設(ssh 自己會試 id_rsa / id_ed25519),不寫死;帳號預設跟這台相同。
+# ControlMaster:傳檔與執行共用一條連線,要密碼只問一次。
+# 對方那份帶 COLLECT_SITE_CHILD=1,直接採它自己,不會再問 Host。
+# 每台報告有自己的 COLLECTOR 標記與 COPY 起訖,一次框起來貼回,normalize_collect.py 會照標記切成多台。
+if [ "$ARGC" -eq 0 ] && [ -z "${COLLECT_SITE_CHILD:-}" ] && [ -t 0 ] && [ -t 2 ] && [ -n "$SELF" ] && [ -r "$SELF" ]; then
+  printf '[collect_site_config] Host to capture: press Enter for this host, or enter IPs (space or comma separated;\n' >&2
+  printf '[collect_site_config] default account %s, use user@ip to change it) to capture them from here over ssh.\n' "$(id -un)" >&2
+  printf '[collect_site_config] Host [this host]: ' >&2
+  IFS= read -r _hosts < /dev/tty || _hosts=""
+  _hosts="$(printf '%s' "$_hosts" | tr ',' ' ')"
+  if [ -n "$(printf '%s' "$_hosts" | tr -d ' \t')" ]; then
+    _rt="/tmp/collect_site_config_$$.sh"
+    for _t in $_hosts; do
+      _ctl="/tmp/.csc_ctl_$$_${_t##*@}"
+      printf '\n[collect_site_config] ===== %s (you may be asked for the ssh password) =====\n' "$_t" >&2
+      if ! ssh -o ControlMaster=yes -o ControlPath="$_ctl" -o ControlPersist=120 -fN "$_t"; then
+        printf '[collect_site_config] Cannot connect to %s, skipped.\n' "$_t" >&2
+        continue
+      fi
+      if ssh -o ControlPath="$_ctl" "$_t" "cat > $_rt" < "$SELF"; then
+        ssh -q -t -o ControlPath="$_ctl" "$_t" "COLLECT_SITE_CHILD=1 bash $_rt; rm -f $_rt"
+      else
+        printf '[collect_site_config] Failed to copy the script to %s, skipped.\n' "$_t" >&2
+      fi
+      ssh -o ControlPath="$_ctl" -O exit "$_t" 2>/dev/null
+    done
+    exit 0
+  fi
 fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -226,7 +263,7 @@ fi
 # 報告不落地靠螢幕複製,所以要起訖標記;走 stderr 才不會混進 stdout。
 printf '\n===== COPY FROM HERE (down to "END OF COPY") =====\n\n' >&2
 
-printf '<!--COLLECTOR:v1.18-->\n'
+printf '<!--COLLECTOR:v1.19-->\n'
 printf '# site config capture — %s(%s)\n' "$(hostname 2>/dev/null || echo unknown)" "$NODE_SELF"
 printf '> Read-only capture. Sensitive values (credentials / private keys) are deliberately not collected.\n'
 printf '> Privilege: %s\n' "${SUDO_NOTE:-not determined}"
@@ -1285,13 +1322,12 @@ else
 fi
 
 # ── 9. 另一個節點(dual)──────
-# 只提醒「有另一台、是哪一台」:不自動連過去,跑法也不印在報告裡(要指令就用 --peer)。
+# 只提醒「有另一台、是哪一台」:不自動連過去;要採就重跑一次,在開頭的 Host 輸入它(v1.19)。
 if [ "$ARCH" = "dual" ]; then
   sec peer "9. The other node"
   if [ -n "$PEER_IP" ]; then
     kv "Peer node" "$PEER_IP$([ -n "$NODE_SELF" ] && printf '(this host is %s)' "$NODE_SELF")"
-    printf -- '- That host has to be captured separately; for the command run `bash %s --peer <user>@%s` (it only prints the command, it does not capture this host)\n' \
-      "$SCRIPT_NAME" "$PEER_IP"
+    printf -- '- That host has to be captured separately; run this script again and enter %s at the Host prompt\n' "$PEER_IP"
   else
     if [ -n "$NODE_1_IP$NODE_2_IP" ]; then
       note "**this host is neither node of the dual pair** (its IPs are not on NODE_1_IP=${NODE_1_IP:-unset} / NODE_2_IP=${NODE_2_IP:-unset}) -- it is most likely a witness / ES or another role host; the two dual nodes each need their own run"
