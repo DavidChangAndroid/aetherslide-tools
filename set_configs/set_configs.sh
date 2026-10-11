@@ -32,6 +32,23 @@
 #   load_reference_tables(); update them when the upstream sample / tph profile
 #   changes.
 #
+# V2.8: every resource value is now capped by this machine's ceiling (rule: no value may
+#   exceed the host limit). Caps win over the tph floor (a warning is printed when a cap
+#   pushes a value below the floor):
+#     CPU  <= round(CORES * CPU_PCT / 100)     (V2.7 only capped at CORES, ignoring CPU_PCT)
+#     MEM  <= round(RAM_GB * RAM_PCT / 100)    (V2.7 had no mem cap: tph floors of 10g could
+#                                               exceed a small host's RAM)
+#     process/concurrency <= the CPU cap
+#   Also manages four runtime-sizing keys that V2.7 never touched (only ever lowered, never
+#   raised; skipped when the key does not exist in this version):
+#     .env        ELASTICSEARCH_HEAP_SIZE            compose default 1024m, ES has no mem
+#                                                     limit -> RAM cap/8, clamped 256..1024m
+#     .env        DATABASE_SHARED_MEMORY_SIZE_MBYTES <= DATABASE_MEM_LIMIT / 4
+#     configs.env EXPORT_NDPI_TO_DICOM_CONCURRENCY   <= CPU cap
+#     configs.env ES_LOG_FILE_MAX_SIZE_GB + ES_METRIC_FILE_MAX_SIZE_GB
+#                                                  <= 25% of the Docker root filesystem
+#                                                     (ES data volume lives there)
+#
 # V2.7 (multi-version; targets 202605.x .. 202609.1+; collapses the set_full_mod fork):
 #   * Resource sizing is now VERSION-ADAPTIVE. The managed key set + example base
 #     values (EX) + kind are DISCOVERED at runtime from the deployed .env.example
@@ -75,7 +92,12 @@ DEFAULT_DISK_PCT=95
 declare -A ENV_UPDATES
 declare -A CONFIGS_UPDATES
 declare -A PREFS_UPDATES
+declare -A ENV_APPEND           # .env keys to set, appending if this version lacks them
 CONFIGS_COMMENT_OUT=()
+EXTRA_PLAN=()                   # "FILE|KEY|CURRENT|NEW|NOTE" rows for show_plan
+CAP_WARN=()
+CPU_CAP=0
+MEM_CAP=0
 
 # Reference tables + regime flag, filled by discover_ref_keys() / compute_values().
 declare -A EX FL KIND FL_SNAP EX_BUILTIN
@@ -96,6 +118,7 @@ main() {
     show_disk_usage
     prompt_percentages
     compute_values
+    compute_extra_limits
     show_plan
     confirm_and_apply
     run_populate_working_dir
@@ -724,7 +747,10 @@ is NOT recommended for production. Proceed at your own risk.
 EOF
     fi
 
-    local k base_ex base_fl kind val
+    CPU_CAP=$(rdiv $(( CORES * CPU_PCT )) 100); (( CPU_CAP < 1 )) && CPU_CAP=1
+    MEM_CAP=$(rdiv $(( RAM_GB * RAM_PCT )) 100); (( MEM_CAP < 1 )) && MEM_CAP=1
+
+    local k base_ex base_fl kind val cap
     for k in "${REF_KEYS[@]}"; do
         base_ex=${EX[$k]}
         base_fl=${FL[$k]}
@@ -748,8 +774,15 @@ EOF
             (( val < base_fl )) && val=$base_fl
         fi
 
-        # A CPU limit can never exceed the physical core count.
-        [[ $kind == cpu ]] && (( val > CORES )) && val=$CORES
+        # Host ceiling wins over the tph floor: no value may exceed this machine's limit.
+        case "$kind" in
+            mem) cap=$MEM_CAP ;;
+            *)   cap=$CPU_CAP ;;
+        esac
+        if (( val > cap )); then
+            (( cap < base_fl )) && CAP_WARN+=("$k: capped to $cap (host ceiling), below the tph floor $base_fl")
+            val=$cap
+        fi
 
         if [[ $kind == mem ]]; then
             ENV_UPDATES[$k]="${val}g"
@@ -757,6 +790,73 @@ EOF
             ENV_UPDATES[$k]=$val
         fi
     done
+}
+
+# compute_extra_limits: runtime-sizing keys outside the *_CPUS/_MEM/_PROCESS/_CONCURRENCY
+# naming scheme. Each is only lowered to fit the host, never raised; absent keys are skipped.
+compute_extra_limits() {
+    local cur
+
+    # ELASTICSEARCH_HEAP_SIZE (.env; usually absent -> compose default 1024m; ES has no mem limit)
+    if grep -qs 'ELASTICSEARCH_HEAP_SIZE' "$website_path/docker-compose.stateful.yaml" "$website_path/docker-compose.yaml"; then
+        cur=$(current_env ELASTICSEARCH_HEAP_SIZE)
+        local heap cur_mb
+        heap=$(( MEM_CAP * 1024 / 8 ))
+        (( heap > 1024 )) && heap=1024
+        (( heap < 256 )) && heap=256
+        if [[ -z $cur ]]; then cur_mb=1024
+        elif [[ $cur =~ ^([0-9]+)[gG]$ ]]; then cur_mb=$(( BASH_REMATCH[1] * 1024 ))
+        else cur_mb=$(num_prefix "$cur"); fi
+        (( heap > cur_mb )) && heap=$cur_mb
+        if [[ -z $cur ]] || (( heap < cur_mb )); then
+            ENV_APPEND[ELASTICSEARCH_HEAP_SIZE]="${heap}m"
+            EXTRA_PLAN+=(".env|ELASTICSEARCH_HEAP_SIZE|${cur:-(default 1024m)}|${heap}m|RAM cap ${MEM_CAP}G / 8, max 1024m")
+        fi
+    fi
+
+    # DATABASE_SHARED_MEMORY_SIZE_MBYTES (.env) <= DATABASE_MEM_LIMIT / 4
+    cur=$(current_env DATABASE_SHARED_MEMORY_SIZE_MBYTES)
+    if [[ -n $cur && -n ${ENV_UPDATES[DATABASE_MEM_LIMIT]:-} ]]; then
+        local db_gb max_shm
+        db_gb=$(num_prefix "${ENV_UPDATES[DATABASE_MEM_LIMIT]}")
+        max_shm=$(( db_gb * 1024 / 4 ))
+        if (( $(num_prefix "$cur") > max_shm )); then
+            ENV_UPDATES[DATABASE_SHARED_MEMORY_SIZE_MBYTES]=$max_shm
+            EXTRA_PLAN+=(".env|DATABASE_SHARED_MEMORY_SIZE_MBYTES|$cur|$max_shm|<= DATABASE_MEM_LIMIT ${db_gb}g / 4")
+        fi
+    fi
+
+    # EXPORT_NDPI_TO_DICOM_CONCURRENCY (configs.env) <= CPU cap
+    cur=$(getenv EXPORT_NDPI_TO_DICOM_CONCURRENCY configs.env || true)
+    if [[ -n $cur ]] && (( $(num_prefix "$cur") > CPU_CAP )); then
+        CONFIGS_UPDATES[EXPORT_NDPI_TO_DICOM_CONCURRENCY]=$CPU_CAP
+        EXTRA_PLAN+=("configs.env|EXPORT_NDPI_TO_DICOM_CONCURRENCY|$cur|$CPU_CAP|<= CPU cap")
+    fi
+
+    # ES_LOG_FILE_MAX_SIZE_GB + ES_METRIC_FILE_MAX_SIZE_GB (configs.env) <= 25% of the Docker root fs
+    local es_log es_met
+    es_log=$(getenv ES_LOG_FILE_MAX_SIZE_GB configs.env || true)
+    es_met=$(getenv ES_METRIC_FILE_MAX_SIZE_GB configs.env || true)
+    if [[ -n $es_log && -n $es_met ]]; then
+        local droot fs_gb budget total nl nm
+        droot=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)
+        [[ -n $droot ]] || droot=/var/lib/docker
+        while [[ ! -e $droot && $droot != / ]]; do droot=$(dirname "$droot"); done
+        fs_gb=$(df -BG --output=size "$droot" 2>/dev/null | tail -n1 | tr -dc '0-9')
+        es_log=$(num_prefix "$es_log"); es_met=$(num_prefix "$es_met")
+        total=$(( es_log + es_met ))
+        if [[ -n $fs_gb ]] && (( fs_gb > 0 && total > 0 )); then
+            budget=$(rdiv $(( fs_gb * 25 )) 100); (( budget < 2 )) && budget=2
+            if (( total > budget )); then
+                nl=$(( es_log * budget / total )); (( nl < 1 )) && nl=1
+                nm=$(( budget - nl ));            (( nm < 1 )) && nm=1
+                CONFIGS_UPDATES[ES_LOG_FILE_MAX_SIZE_GB]=$nl
+                CONFIGS_UPDATES[ES_METRIC_FILE_MAX_SIZE_GB]=$nm
+                EXTRA_PLAN+=("configs.env|ES_LOG_FILE_MAX_SIZE_GB|$es_log|$nl|ES total <= 25% of ${fs_gb}G ($droot)")
+                EXTRA_PLAN+=("configs.env|ES_METRIC_FILE_MAX_SIZE_GB|$es_met|$nm|")
+            fi
+        fi
+    fi
 }
 
 show_plan() {
@@ -783,6 +883,21 @@ show_plan() {
         printf "       %-48s %-12s -> %-12s %s
 " "$k" "$cur" "$new" "$flag"
     done
+
+    echo "       (host ceiling: CPU ${CPU_CAP} cores / RAM ${MEM_CAP}G; process/concurrency <= ${CPU_CAP})"
+    local w
+    for w in "${CAP_WARN[@]}"; do echo "       [WARN] $w"; done
+
+    if (( ${#EXTRA_PLAN[@]} )); then
+        echo
+        echo "[INFO] Planned runtime-sizing changes (lowered to fit this host):"
+        printf "       %-12s %-36s %-18s -> %-10s %s\n" "FILE" "VARIABLE" "CURRENT" "NEW" "WHY"
+        local row f1 f2 f3 f4 f5
+        for row in "${EXTRA_PLAN[@]}"; do
+            IFS='|' read -r f1 f2 f3 f4 f5 <<<"$row"
+            printf "       %-12s %-36s %-18s -> %-10s %s\n" "$f1" "$f2" "$f3" "$f4" "$f5"
+        done
+    fi
 
     echo
     echo "[INFO] Planned changes ($CONFIGS_FILE):"
@@ -852,6 +967,11 @@ confirm_and_apply() {
     # configs.env: comment-outs
     for key in "${CONFIGS_COMMENT_OUT[@]}"; do
         comment_out_env "$key" "$CONFIGS_FILE"
+    done
+
+    # .env keys that may be absent in this version (append if missing)
+    for key in "${!ENV_APPEND[@]}"; do
+        set_or_append_env "$key" "${ENV_APPEND[$key]}" "$ENV_FILE"
     done
 
     # prefs.env: front-end module switches (append the key if it is missing)
