@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# collect_site_config.sh v1.19 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 site config 站頁。
+# collect_site_config.sh v1.20 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 site config 站頁。
 # v1.18 hardware / enclosure additions are unverified on real RAID hardware.
 # 2026-08-07 起**報告輸出全部英文**(國外 FAE 也要用);shell 註解仍保持中文(給維護者看)。
 #
 # 常態用法(零參數):
 #   bash collect.sh
 # 報告直接印在螢幕上,**不落地檔案**;起訖標記走 stderr,自己從螢幕框起來複製。
+# v1.20:第 3 段加 `### CPU (lscpu)` 完整輸出。
 # v1.19:零參數時先問 Host —— Enter = 採本機;輸入 IP = 從這台 ssh 過去採那幾台(不採本機),採完就結束。
 
 
@@ -34,7 +35,7 @@ while [ $# -gt 0 ]; do
       [ -n "$PEER" ] || { echo "--peer requires [user@]host" >&2; exit 2; }
       shift 2 ;;
     -h|--help)
-      printf '%s v1.19 — read-only capture of a customer site environment; prints Markdown to paste into the site config page.\n\n' "$SCRIPT_NAME"
+      printf '%s v1.20 — read-only capture of a customer site environment; prints Markdown to paste into the site config page.\n\n' "$SCRIPT_NAME"
       printf '  bash %s [deploy-dir]            defaults to ~/website. The report is printed to the screen, no file is written\n' "$SCRIPT_NAME"
       printf '  bash %s --peer [user@]host      only prints the command to run this script on that host, then exits; does not capture this host\n' "$SCRIPT_NAME"
       printf '  bash %s --ai-landing-dir DIR    set this when AI Landing is not auto-detected\n\n' "$SCRIPT_NAME"
@@ -263,7 +264,7 @@ fi
 # 報告不落地靠螢幕複製,所以要起訖標記;走 stderr 才不會混進 stdout。
 printf '\n===== COPY FROM HERE (down to "END OF COPY") =====\n\n' >&2
 
-printf '<!--COLLECTOR:v1.19-->\n'
+printf '<!--COLLECTOR:v1.20-->\n'
 printf '# site config capture — %s(%s)\n' "$(hostname 2>/dev/null || echo unknown)" "$NODE_SELF"
 printf '> Read-only capture. Sensitive values (credentials / private keys) are deliberately not collected.\n'
 printf '> Privilege: %s\n' "${SUDO_NOTE:-not determined}"
@@ -463,13 +464,18 @@ fi
 IS_VM=0; have systemd-detect-virt && [ "$(systemd-detect-virt 2>/dev/null)" != "none" ] && IS_VM=1
 sec hw "3. Hardware"
 if have lscpu; then
-  kv "CPU model" "$(lscpu 2>/dev/null | grep -E 'Model name' | sed 's/.*: *//')"
+  kv "CPU model" "$(LC_ALL=C lscpu 2>/dev/null | grep -E 'Model name' | sed 's/.*: *//')"
   kv "CPU cores (logical)" "$(nproc 2>/dev/null)"
 else note "no lscpu"; fi
 if have free; then kv "RAM" "$(free -h 2>/dev/null | awk '/^Mem:/{print $2}')"; fi
 if have nvidia-smi; then
   kv "GPU driver / CUDA" "driver $(tmo 10 nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1) / $(tmo 10 nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -1)"
 fi
+# 完整 lscpu:socket / NUMA / 快取 / flags(AVX 等)都在這,上面只摘了型號與核心數。
+# LC_ALL=C 避免中文 locale 把欄名翻譯掉;`| cat` 防終端寬度截斷。
+printf '<!--SEC:hw.cpu-->\n### CPU (lscpu)\n```\n'
+if have lscpu; then LC_ALL=C lscpu 2>/dev/null | cat; else note "no lscpu"; fi
+printf '```\n'
 printf '<!--SEC:hw.gpu-->\n### GPU\n```\n'
 if have nvidia-smi; then
   tmo 10 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || tmo 10 nvidia-smi -L 2>/dev/null
