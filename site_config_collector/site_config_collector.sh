@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# collect_site_config.sh v1.20 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 site config 站頁。
+# collect_site_config.sh v1.21 — 唯讀採集客戶站台環境資訊,輸出 Markdown 供貼入 site config 站頁。
 # v1.18 hardware / enclosure additions are unverified on real RAID hardware.
 # 2026-08-07 起**報告輸出全部英文**(國外 FAE 也要用);shell 註解仍保持中文(給維護者看)。
 #
 # 常態用法(零參數):
 #   bash collect.sh
 # 報告直接印在螢幕上,**不落地檔案**;起訖標記走 stderr,自己從螢幕框起來複製。
+# v1.21:第 2 段憑證目錄改讀 .env 的 TLS_PATH(tph 是 ./ssl,不是 data/ssl),加內部憑證 / 內部 CA 到期日;
+#        第 7 段加 AI 推論端點憑證(s_client)、AI Landing 主機的 k8s 憑證與 ca-cert.internal.pem 逐張到期日。
 # v1.20:第 3 段加 `### CPU (lscpu)` 完整輸出。
 # v1.19:零參數時先問 Host —— Enter = 採本機;輸入 IP = 從這台 ssh 過去採那幾台(不採本機),採完就結束。
 
@@ -35,7 +37,7 @@ while [ $# -gt 0 ]; do
       [ -n "$PEER" ] || { echo "--peer requires [user@]host" >&2; exit 2; }
       shift 2 ;;
     -h|--help)
-      printf '%s v1.20 — read-only capture of a customer site environment; prints Markdown to paste into the site config page.\n\n' "$SCRIPT_NAME"
+      printf '%s v1.21 — read-only capture of a customer site environment; prints Markdown to paste into the site config page.\n\n' "$SCRIPT_NAME"
       printf '  bash %s [deploy-dir]            defaults to ~/website. The report is printed to the screen, no file is written\n' "$SCRIPT_NAME"
       printf '  bash %s --peer [user@]host      only prints the command to run this script on that host, then exits; does not capture this host\n' "$SCRIPT_NAME"
       printf '  bash %s --ai-landing-dir DIR    set this when AI Landing is not auto-detected\n\n' "$SCRIPT_NAME"
@@ -264,7 +266,7 @@ fi
 # 報告不落地靠螢幕複製,所以要起訖標記;走 stderr 才不會混進 stdout。
 printf '\n===== COPY FROM HERE (down to "END OF COPY") =====\n\n' >&2
 
-printf '<!--COLLECTOR:v1.20-->\n'
+printf '<!--COLLECTOR:v1.21-->\n'
 printf '# site config capture — %s(%s)\n' "$(hostname 2>/dev/null || echo unknown)" "$NODE_SELF"
 printf '> Read-only capture. Sensitive values (credentials / private keys) are deliberately not collected.\n'
 printf '> Privilege: %s\n' "${SUDO_NOTE:-not determined}"
@@ -423,7 +425,34 @@ printf '```\n'
 
 # ── 2. 憑證 ──
 sec cert "2. Certificate (SSL)"
-CERT="$DEPLOY_DIR/data/ssl/cert.pem"
+# 一個 pem 可能串多張(ca-cert.internal.pem 多站共用時),openssl x509 只讀第一張 → 逐張拆開。
+# 讀得到直接讀,讀不到才走 sudo;每張印一行 "<subject> | expires <notAfter>"。
+pem_each() {
+  if [ -r "$1" ]; then _pem="$(cat "$1" 2>/dev/null)"
+  elif sudo_ready; then _pem="$(sq cat "$1" 2>/dev/null)"
+  else return 1; fi
+  _n="$(printf '%s\n' "$_pem" | grep -c 'BEGIN CERTIFICATE')"
+  [ "$_n" -gt 0 ] 2>/dev/null || return 1
+  _i=1
+  while [ "$_i" -le "$_n" ]; do
+    _sub="$(printf '%s\n' "$_pem" | awk -v n="$_i" '/BEGIN CERTIFICATE/{c++} c==n{print} c==n && /END CERTIFICATE/{exit}')"
+    printf '%s | expires %s\n' \
+      "$(printf '%s\n' "$_sub" | openssl x509 -noout -subject 2>/dev/null | sed 's/^subject= *//')" \
+      "$(printf '%s\n' "$_sub" | openssl x509 -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+    _i=$((_i + 1))
+  done
+}
+# 多行值逐行印成同一個 key
+kv_lines() { printf '%s\n' "$2" | while IFS= read -r _l; do [ -n "$_l" ] && kv "$1" "$_l"; done; }
+# 憑證目錄以 .env 的 TLS_PATH 為準(compose 掛成容器內 /CA)。tph 是 ./ssl,舊版寫死 data/ssl 會在 tph 誤報「沒有憑證」。
+TLS_PATH="$(envval "$DEPLOY_DIR/.env" TLS_PATH)"
+case "$TLS_PATH" in
+  "") TLS_DIR="$DEPLOY_DIR/data/ssl" ;;
+  /*) TLS_DIR="$TLS_PATH" ;;
+  *)  TLS_DIR="$DEPLOY_DIR/${TLS_PATH#./}" ;;
+esac
+kv "Certificate directory" "$TLS_DIR$([ -n "$TLS_PATH" ] && printf ' (.env TLS_PATH=%s)' "$TLS_PATH" || printf ' (.env has no TLS_PATH; default)')"
+CERT="$TLS_DIR/cert.pem"
 # 「檔案不存在」與「存在但讀不到」要講不同的話:cert 常是 0600 root:root,`[ -f ]` 過得了但
 # openssl 讀不到 —— 舊版兩種都印「找不到」,權限問題會偽裝成「這站沒有憑證」。
 CERT_READ=""   # direct=一般權限可讀 / sudo=要 root / 空=讀不到
@@ -454,11 +483,25 @@ elif [ -f "$CERT" ]; then
 elif printf '%s' "$(envval "$DEPLOY_DIR/configs.env" MODULES)" | grep -q caddy ||
      { have docker && tmo 8 docker ps --format '{{.Names}}' 2>/dev/null | grep -q caddy; }; then
   # 啟用 caddy 的站台憑證由 caddy 自己申請與續約,不會放在 data/ssl
-  kv "Certificate management" "caddy (ACME issues / renews automatically), not under $DEPLOY_DIR/data/ssl"
+  kv "Certificate management" "caddy (ACME issues / renews automatically), not under $TLS_DIR"
   note "certificate detail would require entering the caddy container or reading its data dir; this script does not enter containers"
 else
   note "$CERT does not exist (the file is genuinely absent, not a permission problem) and no caddy was detected -- for a non-standard path pass the deploy directory argument, or ask the customer where the certificate lives"
 fi
+# 內部憑證 / 內部 CA(節點間 TLS,WEB_INTERNAL_CERT_PATH / WEB_INTERNAL_CA_CERT_PATH)
+printf '<!--SEC:cert.internal-->\n### Internal certificates (node-to-node TLS)\n'
+for _f in cert.internal.pem ca-cert.internal.pem; do
+  # 目錄可能 root-only,一般權限的 [ -f ] 會誤判不存在
+  if [ ! -f "$TLS_DIR/$_f" ] && ! { sudo_ready && sq test -f "$TLS_DIR/$_f"; }; then
+    kv "$_f" "not found under $TLS_DIR"
+  elif ! have openssl; then
+    kv "$_f" "exists, but this host has no openssl command"
+  else
+    _o="$(pem_each "$TLS_DIR/$_f")"
+    if [ -n "$_o" ]; then kv_lines "$_f" "$_o"
+    else kv "$_f" "exists but cannot be read (permissions; sudo state: ${SUDO_NOTE:-not determined})"; fi
+  fi
+done
 
 # ── 3. 硬體 ──────
 IS_VM=0; have systemd-detect-virt && [ "$(systemd-detect-virt 2>/dev/null)" != "none" ] && IS_VM=1
@@ -1154,6 +1197,26 @@ fi
 # ── 7. GPU node / AI Landing(AI 推論主機)──────
 # microk8s + helm,不是 docker compose,所以整段是另一套指令。不自動 SSH 過去。
 sec ai "7. GPU node / AI Landing (AI inference)"
+# AI_LANDING_URL 是 https 時,從這台直接問對方出示的憑證(= AI 端對外憑證)。叢集內部憑證只能到那台採。
+ail_endpoint_cert() {
+  case "$AIL_URL" in
+    https://*) ;;
+    *) kv "AI endpoint certificate" "none (AI_LANDING_URL is not https)"; return 0 ;;
+  esac
+  have openssl || { note "no openssl command, cannot read the AI endpoint certificate"; return 0; }
+  _hp="$(printf '%s' "$AIL_URL" | sed -E 's#^https://##; s#/.*$##')"
+  _h="${_hp%%:*}"
+  case "$_hp" in *:*) _p="${_hp##*:}" ;; *) _p=443 ;; esac
+  _o="$(tmo 10 openssl s_client -connect "$_h:$_p" -servername "$_h" </dev/null 2>/dev/null |
+    openssl x509 -noout -subject -issuer -enddate 2>/dev/null)"
+  if [ -n "$_o" ]; then
+    kv "AI endpoint certificate ($_h:$_p) subject" "$(printf '%s\n' "$_o" | sed -n 's/^subject= *//p')"
+    kv "AI endpoint certificate issuer" "$(printf '%s\n' "$_o" | sed -n 's/^issuer= *//p')"
+    kv "AI endpoint certificate expires" "$(printf '%s\n' "$_o" | sed -n 's/^notAfter=//p')"
+  else
+    note "could not fetch a certificate from $_h:$_p within 10s (unreachable from this host, or not TLS)"
+  fi
+}
 if [ "$HAS_AIL" = "0" ]; then
   note "no AI Landing on this host (no values.yaml in a deploy directory and no $AIL_NS namespace)"
   if [ -n "${AIL_URL:-}" ]; then
@@ -1167,6 +1230,7 @@ if [ "$HAS_AIL" = "0" ]; then
       printf '```\nbash collect.sh\n```\n'
       printf -- '- _For an FQDN the real IP is decided by customer DNS/NAT; confirm by hand which host it resolves to_\n'
     fi
+    ail_endpoint_cert
   else
     note "this host has no aetherSlide AI_LANDING_URL to go by either, so the inference host cannot be located"
   fi
@@ -1285,6 +1349,32 @@ else
     printf '```\n'
   fi
 
+  # ── k8s 憑證到期日 ──
+  # 直接讀 cert 目錄的 .crt,不跑 `microk8s refresh-certs --check`(同指令帶別的旗標就是寫入動作)。
+  # microk8s 目錄是 root:microk8s 0660,在 microk8s group 可直接讀,否則走 sudo。
+  printf '<!--SEC:ai.k8s_certs-->\n### k8s certificates (expiry)\n'
+  K8S_CERT_DIR=""
+  for _d in /var/snap/microk8s/current/certs /etc/kubernetes/pki; do
+    [ -d "$_d" ] && { K8S_CERT_DIR="$_d"; break; }
+  done
+  if [ -z "$K8S_CERT_DIR" ]; then
+    note "no k8s certificate directory found (/var/snap/microk8s/current/certs, /etc/kubernetes/pki)"
+  elif ! have openssl; then
+    note "no openssl command, cannot read $K8S_CERT_DIR"
+  else
+    kv "Certificate directory" "$K8S_CERT_DIR"
+    _crts="$(ls "$K8S_CERT_DIR" 2>/dev/null || { sudo_ready && sq ls "$K8S_CERT_DIR" 2>/dev/null; })"
+    _crts="$(printf '%s\n' "$_crts" | grep '\.crt$')"
+    if [ -z "$_crts" ]; then
+      note "cannot list $K8S_CERT_DIR (permissions; sudo state: ${SUDO_NOTE:-not determined}) or it has no .crt"
+    else
+      for _c in $_crts; do
+        _o="$(pem_each "$K8S_CERT_DIR/$_c")"
+        if [ -n "$_o" ]; then kv_lines "$_c" "$_o"; else kv "$_c" "cannot be read"; fi
+      done
+    fi
+  fi
+
   # ── aetherSlide 憑證註冊(兩邊的信任鏈)──
   CA=""
   for _c in "$AIL_DIR/ca-cert.internal.pem" "$AIL_DIR/bin/ca-cert.internal.pem"; do
@@ -1292,6 +1382,11 @@ else
   done
   if [ -n "$CA" ]; then
     kv "aetherSlide CA certificate file" "$CA (contains $(grep -c 'BEGIN CERTIFICATE' "$CA" 2>/dev/null) certificate(s); several are concatenated when multiple sites share one inference host)"
+    # 實測 .40 串了 63 張(多站重複註冊),去重後放 code block,不逐張 kv
+    if have openssl; then
+      printf '<!--SEC:ai.ca_certs-->\n#### aetherSlide CA certificates in that file (deduplicated; subject | expires)\n'
+      printf '```\n%s\n```\n' "$(pem_each "$CA" | sort -u)"
+    fi
   else
     note "cannot find ca-cert.internal.pem (used by k8s_init.sh for registration); registered certificates live in the cluster, so a missing file does not mean nothing was registered"
   fi
