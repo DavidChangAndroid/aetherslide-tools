@@ -32,6 +32,26 @@
 #   load_reference_tables(); update them when the upstream sample / tph profile
 #   changes.
 #
+# V2.9: robustness fixes from a review against the 202611 develop tree (sizing rules unchanged):
+#   * RAM detection rounds instead of truncating: an "8G" VM reports ~7.7 GiB MemTotal, which
+#     V2.8 truncated to 7 and wrongly treated as below the 4C/8G minimum.
+#   * Resource keys present in .env.example but missing (or commented out) in the deployed .env
+#     are now ADDED. V2.8 printed the new value in the plan and then silently skipped the write,
+#     leaving compose with an empty ${KEY}. (Only when the key set comes from .env.example; the
+#     built-in fallback table still update-only.) Same for DATABASE_SHARED_MEMORY_SIZE_MBYTES and
+#     the ES_*_FILE_MAX_SIZE_GB pair (missing -> start from the example / curator default 30/5).
+#     Missing keys are INSERTED at their .example position (after the nearest preceding example
+#     key), never appended to configs.env / prefs.env; no position there -> WARN + skip. .env
+#     keeps the append fallback only for keys no example lists (ELASTICSEARCH_HEAP_SIZE).
+#   * ES data location honours ES_DATA_VOLUME_PATH (bind path) for both the fscrypt encrypt-
+#     feature check and the ES disk budget; falls back to the Docker data-root as before. The
+#     plan now warns when the ES budget exceeds the free space on that filesystem.
+#   * .env.example values are parsed with units/decimals (512m, 1.5g, 0.5 CPU) instead of taking
+#     the leading integer as GiB/cores. Output format is unchanged (integer cores, integer g).
+#   * Intentionally NOT changed: NDPI->DICOM export sizing (background worker floors and
+#     EXPORT_NDPI_TO_DICOM_CONCURRENCY). Few sites enable it; it needs dedicated hardware, and
+#     scaling it down to fit a small host only produces an unacceptably slow conversion.
+#
 # V2.8: every resource value is now capped by this machine's ceiling (rule: no value may
 #   exceed the host limit). Caps win over the tph floor (a warning is printed when a cap
 #   pushes a value below the floor):
@@ -93,6 +113,8 @@ declare -A ENV_UPDATES
 declare -A CONFIGS_UPDATES
 declare -A PREFS_UPDATES
 declare -A ENV_APPEND           # .env keys to set, appending if this version lacks them
+declare -A CONFIGS_APPEND       # configs.env keys to set, appending if missing / commented
+EX_SOURCE=""                    # "example" (deployed .env.example) or "builtin" (fallback table)
 CONFIGS_COMMENT_OUT=()
 EXTRA_PLAN=()                   # "FILE|KEY|CURRENT|NEW|NOTE" rows for show_plan
 CAP_WARN=()
@@ -197,12 +219,9 @@ check_disk_encryption() {
     # fscrypt-encrypts, so they are intentionally NOT checked here.
     echo "[INFO] Checking disk encryption for the Elasticsearch data volume..."
 
-    # Where Docker stores named volumes (es_data lives here).
-    local docker_root
-    docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)
-    [[ -z $docker_root ]] && docker_root=/var/lib/docker
-    local vol_dir="$docker_root/volumes"
-    [[ -d $vol_dir ]] || vol_dir="$docker_root"
+    # Where ES data lives: ES_DATA_VOLUME_PATH bind path if set, else the Docker data-root.
+    local vol_dir
+    vol_dir=$(es_data_dir)
 
     # Resolve the backing device + filesystem type.
     local dev fstype
@@ -257,6 +276,26 @@ check_disk_encryption() {
         exit 1
     fi
     echo
+}
+
+# es_data_dir -> nearest existing host directory backing the ES data
+# (compose: "${ES_DATA_VOLUME_PATH:-es_data}:/bitnami/elasticsearch").
+#   - value with a "/" is a bind path (relative paths resolve against the compose dir);
+#   - otherwise it is a named volume, which lives under the Docker data-root.
+es_data_dir() {
+    local v d
+    v=$(getenv ES_DATA_VOLUME_PATH .env 2>/dev/null || true)
+    if [[ $v == /* ]]; then
+        d=$v
+    elif [[ $v == */* ]]; then
+        d="$website_path/${v#./}"
+    else
+        d=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)
+        [[ -n $d ]] || d=/var/lib/docker
+        [[ -d $d/volumes ]] && d="$d/volumes"
+    fi
+    while [[ ! -e $d && $d != / ]]; do d=$(dirname "$d"); done
+    echo "$d"
 }
 
 check_storage_mounts() {
@@ -375,7 +414,8 @@ check_storage_mounts() {
 
 detect_hardware() {
     CORES=$(nproc)
-    RAM_GB=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)
+    # Round (not truncate): an "8G" VM reports ~7.7 GiB and must not count as below 8G.
+    RAM_GB=$(awk '/MemTotal/ {printf "%d", $2/1024/1024 + 0.5}' /proc/meminfo)
 
     echo "[INFO] Detected hardware:"
     echo "       CPU cores : $CORES"
@@ -678,6 +718,28 @@ kind_of() {
 # num_prefix <val> -> leading integer ("10g" -> 10, "32" -> 32)
 num_prefix() { local v=$1; v=${v%%[!0-9]*}; echo "${v:-0}"; }
 
+# to_fine <val> <kind> -> integer in fine units: mem -> MiB, cpu/num -> thousandths.
+#   Accepts decimals and docker units: "20g"->20480, "512m"->512, "1.5g"->1536, "0.5"(cpu)->500.
+#   A bare mem number is taken as GiB (the convention of every .env.example so far).
+to_fine() {
+    awk -v v="$1" -v k="$2" 'BEGIN {
+        if (!match(v, /^[0-9]*\.?[0-9]+/)) { print 0; exit }
+        n = substr(v, RSTART, RLENGTH) + 0
+        u = tolower(substr(v, RSTART + RLENGTH, 1))
+        if (k == "mem") {
+            m = 1024
+            if (u == "m") m = 1; else if (u == "k") m = 1/1024
+            else if (u == "b") m = 1/1048576; else if (u == "t") m = 1048576
+            printf "%d", n * m + 0.5
+        } else {
+            printf "%d", n * 1000 + 0.5
+        }
+    }'
+}
+
+# fine_unit <kind> -> divisor turning a to_fine value back into GiB / whole units
+fine_unit() { [[ $1 == mem ]] && echo 1024 || echo 1000; }
+
 # discover_ref_keys -> fill EX / KIND / FL / REF_KEYS (+ per-kind ordered lists) by
 # scanning the DEPLOYED .env.example, so the managed key set + base values track the
 # installed version. Falls back to the built-in 202609.1 table if unreadable.
@@ -691,7 +753,7 @@ discover_ref_keys() {
             key=${line%%=*}
             kind=$(kind_of "$key")
             [[ -n $kind ]] || continue
-            val=$(num_prefix "${line#*=}")
+            val=$(to_fine "${line#*=}" "$kind")
             EX[$key]=$val; KIND[$key]=$kind; REF_KEYS+=("$key")
             case "$kind" in
                 cpu) REF_KEYS_CPU+=("$key") ;;
@@ -699,12 +761,15 @@ discover_ref_keys() {
                 num) REF_KEYS_NUM+=("$key") ;;
             esac
         done < "$example"
+        EX_SOURCE=example
     fi
     if ((${#REF_KEYS[@]} == 0)); then
         echo "[WARN] $example not readable — using the built-in 202609.1 base table." >&2
+        EX_SOURCE=builtin
         load_builtin_ex_table
         for key in "${!EX_BUILTIN[@]}"; do
-            EX[$key]=${EX_BUILTIN[$key]}; KIND[$key]=$(kind_of "$key"); REF_KEYS+=("$key")
+            kind=$(kind_of "$key")
+            EX[$key]=$(( EX_BUILTIN[$key] * $(fine_unit "$kind") )); KIND[$key]=$kind; REF_KEYS+=("$key")
         done
         local sk
         for sk in $(printf '%s
@@ -765,11 +830,11 @@ EOF
             fi
             (( val < 1 )) && val=1
         else
-            # scale from .env.example, then never drop below the tph floor.
+            # scale from .env.example (fine units, see to_fine), then never drop below the tph floor.
             if [[ $kind == mem ]]; then
-                val=$(rdiv $(( base_ex * RAM_GB * RAM_PCT )) $(( BASE_RAM_GB * 100 )))
+                val=$(rdiv $(( base_ex * RAM_GB * RAM_PCT )) $(( BASE_RAM_GB * 100 * 1024 )))
             else
-                val=$(rdiv $(( base_ex * CORES * CPU_PCT )) $(( BASE_CORES * 100 )))
+                val=$(rdiv $(( base_ex * CORES * CPU_PCT )) $(( BASE_CORES * 100 * 1000 )))
             fi
             (( val < base_fl )) && val=$base_fl
         fi
@@ -805,8 +870,8 @@ compute_extra_limits() {
         (( heap > 1024 )) && heap=1024
         (( heap < 256 )) && heap=256
         if [[ -z $cur ]]; then cur_mb=1024
-        elif [[ $cur =~ ^([0-9]+)[gG]$ ]]; then cur_mb=$(( BASH_REMATCH[1] * 1024 ))
-        else cur_mb=$(num_prefix "$cur"); fi
+        elif [[ $cur =~ ^[0-9]+$ ]]; then cur_mb=$cur      # bare number: already MB here
+        else cur_mb=$(to_fine "$cur" mem); fi
         (( heap > cur_mb )) && heap=$cur_mb
         if [[ -z $cur ]] || (( heap < cur_mb )); then
             ENV_APPEND[ELASTICSEARCH_HEAP_SIZE]="${heap}m"
@@ -815,12 +880,22 @@ compute_extra_limits() {
     fi
 
     # DATABASE_SHARED_MEMORY_SIZE_MBYTES (.env) <= DATABASE_MEM_LIMIT / 4
+    # compose has no default for it, so a key missing from .env starts from the .env.example value.
     cur=$(current_env DATABASE_SHARED_MEMORY_SIZE_MBYTES)
+    local shm_missing=0
+    if [[ -z $cur ]]; then
+        cur=$(grep -m1 '^DATABASE_SHARED_MEMORY_SIZE_MBYTES=' "$website_path/.env.example" 2>/dev/null | cut -d= -f2- || true)
+        [[ -n $cur ]] && shm_missing=1
+    fi
     if [[ -n $cur && -n ${ENV_UPDATES[DATABASE_MEM_LIMIT]:-} ]]; then
-        local db_gb max_shm
+        local db_gb max_shm new_shm
         db_gb=$(num_prefix "${ENV_UPDATES[DATABASE_MEM_LIMIT]}")
         max_shm=$(( db_gb * 1024 / 4 ))
-        if (( $(num_prefix "$cur") > max_shm )); then
+        new_shm=$(num_prefix "$cur"); (( new_shm > max_shm )) && new_shm=$max_shm
+        if (( shm_missing )); then
+            ENV_APPEND[DATABASE_SHARED_MEMORY_SIZE_MBYTES]=$new_shm
+            EXTRA_PLAN+=(".env|DATABASE_SHARED_MEMORY_SIZE_MBYTES|(missing)|$new_shm|example $cur, <= DATABASE_MEM_LIMIT ${db_gb}g / 4")
+        elif (( $(num_prefix "$cur") > max_shm )); then
             ENV_UPDATES[DATABASE_SHARED_MEMORY_SIZE_MBYTES]=$max_shm
             EXTRA_PLAN+=(".env|DATABASE_SHARED_MEMORY_SIZE_MBYTES|$cur|$max_shm|<= DATABASE_MEM_LIMIT ${db_gb}g / 4")
         fi
@@ -833,28 +908,33 @@ compute_extra_limits() {
         EXTRA_PLAN+=("configs.env|EXPORT_NDPI_TO_DICOM_CONCURRENCY|$cur|$CPU_CAP|<= CPU cap")
     fi
 
-    # ES_LOG_FILE_MAX_SIZE_GB + ES_METRIC_FILE_MAX_SIZE_GB (configs.env) <= 25% of the Docker root fs
-    local es_log es_met
-    es_log=$(getenv ES_LOG_FILE_MAX_SIZE_GB configs.env || true)
-    es_met=$(getenv ES_METRIC_FILE_MAX_SIZE_GB configs.env || true)
-    if [[ -n $es_log && -n $es_met ]]; then
-        local droot fs_gb budget total nl nm
-        droot=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)
-        [[ -n $droot ]] || droot=/var/lib/docker
-        while [[ ! -e $droot && $droot != / ]]; do droot=$(dirname "$droot"); done
-        fs_gb=$(df -BG --output=size "$droot" 2>/dev/null | tail -n1 | tr -dc '0-9')
-        es_log=$(num_prefix "$es_log"); es_met=$(num_prefix "$es_met")
-        total=$(( es_log + es_met ))
-        if [[ -n $fs_gb ]] && (( fs_gb > 0 && total > 0 )); then
-            budget=$(rdiv $(( fs_gb * 25 )) 100); (( budget < 2 )) && budget=2
-            if (( total > budget )); then
-                nl=$(( es_log * budget / total )); (( nl < 1 )) && nl=1
-                nm=$(( budget - nl ));            (( nm < 1 )) && nm=1
-                CONFIGS_UPDATES[ES_LOG_FILE_MAX_SIZE_GB]=$nl
-                CONFIGS_UPDATES[ES_METRIC_FILE_MAX_SIZE_GB]=$nm
-                EXTRA_PLAN+=("configs.env|ES_LOG_FILE_MAX_SIZE_GB|$es_log|$nl|ES total <= 25% of ${fs_gb}G ($droot)")
-                EXTRA_PLAN+=("configs.env|ES_METRIC_FILE_MAX_SIZE_GB|$es_met|$nm|")
-            fi
+    # ES_LOG_FILE_MAX_SIZE_GB + ES_METRIC_FILE_MAX_SIZE_GB (configs.env) <= 25% of the filesystem
+    # holding the ES data (ES_DATA_VOLUME_PATH bind path, else the Docker data-root).
+    # Missing / commented keys fall back to the curator defaults (monitoring/curator/actions.yml:
+    # ${ES_LOG_FILE_MAX_SIZE_GB:30}, ${ES_METRIC_FILE_MAX_SIZE_GB:5}) and are added when lowered.
+    local es_log es_met cur_log cur_met
+    cur_log=$(getenv ES_LOG_FILE_MAX_SIZE_GB configs.env || true)
+    cur_met=$(getenv ES_METRIC_FILE_MAX_SIZE_GB configs.env || true)
+    es_log=$(num_prefix "${cur_log:-30}"); es_met=$(num_prefix "${cur_met:-5}")
+    local esdir fs_gb avail_gb budget total nl nm
+    esdir=$(es_data_dir)
+    read -r fs_gb avail_gb < <(df -BG --output=size,avail "$esdir" 2>/dev/null | tail -n1 | tr -d 'G') || true
+    total=$(( es_log + es_met ))
+    if [[ $fs_gb =~ ^[0-9]+$ ]] && (( fs_gb > 0 && total > 0 )); then
+        budget=$(rdiv $(( fs_gb * 25 )) 100); (( budget < 2 )) && budget=2
+        if (( total > budget )); then
+            nl=$(( es_log * budget / total )); (( nl < 1 )) && nl=1
+            nm=$(( budget - nl ));            (( nm < 1 )) && nm=1
+            CONFIGS_APPEND[ES_LOG_FILE_MAX_SIZE_GB]=$nl
+            CONFIGS_APPEND[ES_METRIC_FILE_MAX_SIZE_GB]=$nm
+            EXTRA_PLAN+=("configs.env|ES_LOG_FILE_MAX_SIZE_GB|${cur_log:-(default 30)}|$nl|ES total <= 25% of ${fs_gb}G ($esdir)")
+            EXTRA_PLAN+=("configs.env|ES_METRIC_FILE_MAX_SIZE_GB|${cur_met:-(default 5)}|$nm|")
+            total=$budget
+        fi
+        # Free space is only warned about (not used as a cap): it already excludes the space ES
+        # itself occupies, so capping on it would shrink the budget on every re-run.
+        if [[ $avail_gb =~ ^[0-9]+$ ]] && (( avail_gb < total )); then
+            CAP_WARN+=("ES log+metric budget ${total}G exceeds the ${avail_gb}G currently free on $esdir — free up disk or lower ES_*_FILE_MAX_SIZE_GB")
         fi
     fi
 }
@@ -880,6 +960,9 @@ show_plan() {
         new=${ENV_UPDATES[$k]}
         flag=""
         [[ $cur == "$new" ]] && flag="(unchanged)"
+        if [[ -z $cur ]]; then
+            [[ $EX_SOURCE == example ]] && flag="(missing in .env -> will add)" || flag="(missing in .env -> skipped)"
+        fi
         printf "       %-48s %-12s -> %-12s %s
 " "$k" "$cur" "$new" "$flag"
     done
@@ -957,7 +1040,13 @@ confirm_and_apply() {
 
     local key
     for key in "${!ENV_UPDATES[@]}"; do
-        update_env "$key" "${ENV_UPDATES[$key]}" "$ENV_FILE"
+        # Resource keys discovered from this version's .env.example are added when the
+        # deployed .env lacks them (compose has no default for them).
+        if [[ -n ${KIND[$key]:-} && $EX_SOURCE == example ]]; then
+            set_or_append_env "$key" "${ENV_UPDATES[$key]}" "$ENV_FILE"
+        else
+            update_env "$key" "${ENV_UPDATES[$key]}" "$ENV_FILE"
+        fi
     done
 
     # configs.env: value updates
@@ -967,6 +1056,10 @@ confirm_and_apply() {
     # configs.env: comment-outs
     for key in "${CONFIGS_COMMENT_OUT[@]}"; do
         comment_out_env "$key" "$CONFIGS_FILE"
+    done
+    # configs.env: runtime-sizing keys that may be missing / commented (append if missing)
+    for key in "${!CONFIGS_APPEND[@]}"; do
+        set_or_append_env "$key" "${CONFIGS_APPEND[$key]}" "$CONFIGS_FILE"
     done
 
     # .env keys that may be absent in this version (append if missing)
@@ -1048,18 +1141,37 @@ run_populate_working_dir() {
     fi
 }
 
-# set_or_append_env <key> <value> <file> -> update if present (or commented),
-# otherwise append. Used for the module switches so a version whose prefs.env lacks
-# the key still gets it set.
+# set_or_append_env <key> <value> <file> -> update if present (or commented), otherwise
+# INSERT it where <file>.example has it: right after the nearest preceding example key that
+# the file already has (active or commented). Never appended at the end of configs.env /
+# prefs.env (a key at the bottom is easy to miss and looks unrelated to its section); with no
+# anchor there it is skipped with a WARN. .env keeps the V2.8 append fallback (e.g.
+# ELASTICSEARCH_HEAP_SIZE, which no .env.example lists).
 set_or_append_env() {
-    local key=$1 val=$2 file=$3
+    local key=$1 val=$2 file=$3 ex="$3.example" prev anchor=""
     if grep -q "^$key=" "$file"; then
         sed -i "s|^$key=.*|$key=$val|" "$file"
+        return
     elif grep -q "^#$key=" "$file"; then
         sed -i "s|^#$key=.*|$key=$val|" "$file"
-    else
+        return
+    fi
+    if [[ -r $ex ]]; then
+        # example keys before <key>, nearest first (nothing if the example does not list <key>)
+        while IFS= read -r prev; do
+            grep -qE "^#?$prev=" "$file" && { anchor=$prev; break; }
+        done < <(awk -v k="$key" '/^#?[A-Za-z0-9_]+=/ { n=$0; sub(/^#/,"",n); sub(/=.*/,"",n); if (n==k) { f=1; exit } a[++c]=n }
+                                  END { if (f) for (i=c; i>=1; i--) print a[i] }' "$ex")
+    fi
+    if [[ -n $anchor ]]; then
+        awk -v a="$anchor" -v line="$key=$val" '{ print } !done && $0 ~ ("^#?" a "=") { print line; done=1 }' \
+            "$file" > "$file.tmp.$$" && cat "$file.tmp.$$" > "$file" && rm -f "$file.tmp.$$"
+        echo "[INFO] $key was absent in $(basename "$file") — inserted after $anchor." >&2
+    elif [[ $(basename "$file") == .env ]]; then
         printf '%s=%s\n' "$key" "$val" >> "$file"
         echo "[INFO] $key was absent in $(basename "$file") — appended." >&2
+    else
+        echo "[WARN] $key is absent in $(basename "$file") and has no position in $(basename "$ex") — skipped; add it by hand: $key=$val" >&2
     fi
 }
 
